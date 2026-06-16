@@ -127,6 +127,10 @@ cd /Users/phani/Work/Adhoc/kaggle/qrproblem
 git status   # operates on qrproblem's own .git
 ```
 
+## Results Tracking
+
+Every leaderboard submission must have its geometric mean score recorded in the Results Log table in `experiment_plan.md`. Capture the per-shape timings from the Popcorn output and compute the geometric mean across all benchmark shapes.
+
 ## Key Constraints
 
 - Single Python file submission
