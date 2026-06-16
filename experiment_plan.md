@@ -43,6 +43,7 @@
 | V6 | Optimized (vectorized V/T, nb=64) | 322 | 7330 | 34400 | 598000 | 239000 | 76800 | 52100 | — | — | 22/22 pass. Minor gain on (640,512): 616→598ms. (40,352) regressed 27→34ms with nb=64 |
 | V7 | torch.compile trailing update | — | — | — | — | — | — | — | — | — | TIMEOUT: torch.compile compilation >300s on Modal |
 | V8 | Tuned nb per shape | — | — | — | — | — | — | — | — | — | TIMEOUT: leaderboard mode exceeds 300s Modal limit |
+| V9 | C++ blocked QR (load_inline) | 335 | 6760 | 26800 | 620000 | 240000 | 77000 | 52100 | 32243 (7-shape) | LB submitted | 22/22 pass B200. Block loop in C++ via load_inline, ATen geqrf panel + bmm trailing. (40,176) improved 7.8→6.8ms |
 
 ## Key Findings
 
@@ -56,6 +57,9 @@
 8. **V5 is our best leaderboard submission**: ~1.7× over baseline on (640,512). V7/V8 hit 300s Modal timeout on leaderboard mode.
 9. **Python-level ceiling reached**: Blocked WY with torch.geqrf panel + torch.bmm trailing update has hit its limit. Further gains require custom CUDA kernels that eliminate Python from the hot loop entirely.
 10. **Next step**: Custom CUDA kernel (load_inline) that does the entire blocked QR in C++/CUDA, calling cuSOLVER for panel and cuBLAS for trailing update without Python overhead. This is U4+U5 combined.
+11. **V9 C++ blocked QR (June 16)**: Moving the block loop to C++ via load_inline eliminates Python dispatch overhead. Gains on medium shapes ((40,176): 7.8→6.8ms) but critical (640,512) unchanged at 620ms — dominated by cuSOLVER panel + cuBLAS trailing, not Python dispatch.
+12. **V10 experiments (June 16)**: Custom CUDA panel kernel is SLOWER than cuSOLVER for batch=640 (serial column processing can't match cuSOLVER's optimized batched implementation). Custom CUDA V/T kernel also slower (thread-block serialization worse than many small cuBLAS calls). nb=64 fails correctness on ill-conditioned matrices due to TF32 error accumulation. TF32 enabled explicitly fails band/rowscale tests. PyTorch 2.12 default allow_tf32=False on Modal.
+13. **The 870× gap to #1 (704μs vs 620ms)** requires a fundamentally different approach — either cuSOLVERDx (device-side QR in shared memory), or a fully fused custom kernel with no cuSOLVER/cuBLAS calls at all.
 
 ## Current Best Configuration
 
