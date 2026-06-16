@@ -44,6 +44,7 @@
 | V7 | torch.compile trailing update | — | — | — | — | — | — | — | — | — | TIMEOUT: torch.compile compilation >300s on Modal |
 | V8 | Tuned nb per shape | — | — | — | — | — | — | — | — | — | TIMEOUT: leaderboard mode exceeds 300s Modal limit |
 | V9 | C++ blocked QR (load_inline) | 335 | 6760 | 26800 | 620000 | 240000 | 77000 | 52100 | 32243 (7-shape) | LB submitted | 22/22 pass B200. Block loop in C++ via load_inline, ATen geqrf panel + bmm trailing. (40,176) improved 7.8→6.8ms |
+| V11 | Fused n<=32 + blocked QR | 131 | 9510 | 28200 | 619000 | 240000 | 76900 | 52300 | 29825 (7-shape) | LB submitted | 22/22 pass. Fused CUDA kernel for n<=32 (2.6x faster). Blocked QR for medium. Geomean 7.5% better than V9 |
 
 ## Key Findings
 
