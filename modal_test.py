@@ -16,8 +16,14 @@ from pathlib import Path
 
 app = modal.App("qr-kernel-test")
 
+cuda_version = "12.4.0"
+flavor = "devel"
+os_version = "ubuntu22.04"
+cuda_tag = f"{cuda_version}-{flavor}-{os_version}"
+
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry(f"nvidia/cuda:{cuda_tag}", add_python="3.11")
+    .apt_install("ninja-build")
     .pip_install("torch", "numpy")
     .add_local_file("task.py", remote_path="/root/harness/task.py")
     .add_local_file("reference.py", remote_path="/root/harness/reference.py")
