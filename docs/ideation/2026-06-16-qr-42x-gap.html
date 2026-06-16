@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ideation: Closing the 42× Gap to QR Leaderboard #1</title>
+<style>
+:root { --bg: #1a1a2e; --card: #16213e; --accent: #0f3460; --text: #e0e0e0; --highlight: #e94560; --green: #4ecca3; --dim: #999; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; max-width: 1100px; margin: 0 auto; }
+h1 { color: #fff; margin-bottom: 0.5rem; font-size: 1.8rem; }
+h2 { color: var(--green); margin: 2rem 0 1rem; border-bottom: 1px solid var(--accent); padding-bottom: 0.5rem; }
+h3 { color: #ccc; margin: 1.5rem 0 0.5rem; }
+.subtitle { color: var(--dim); margin-bottom: 2rem; }
+.gap-viz { background: var(--card); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; }
+.gap-bar { height: 24px; border-radius: 4px; margin: 0.5rem 0; position: relative; }
+.gap-bar .fill { height: 100%; border-radius: 4px; }
+.gap-bar .label { position: absolute; right: 8px; top: 2px; font-size: 0.8rem; color: #fff; }
+.idea { background: var(--card); border-radius: 8px; padding: 1.5rem; margin: 1rem 0; border-left: 4px solid var(--green); }
+.idea.top { border-left-color: var(--highlight); }
+.idea h4 { color: #fff; margin-bottom: 0.5rem; }
+.idea .axis { display: inline-block; background: var(--accent); color: var(--green); padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; margin-right: 0.5rem; }
+.idea .basis { color: var(--dim); font-size: 0.85rem; margin-top: 0.5rem; font-style: italic; }
+.idea .impact { color: var(--highlight); font-weight: bold; font-size: 0.85rem; }
+.rejected { background: var(--card); border-radius: 8px; padding: 1rem; margin: 0.5rem 0; opacity: 0.7; border-left: 3px solid #555; }
+.rejected h4 { color: #888; font-size: 0.9rem; }
+.rejected .reason { color: var(--dim); font-size: 0.8rem; }
+table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid var(--accent); }
+th { color: var(--green); }
+code { background: var(--accent); padding: 2px 6px; border-radius: 3px; font-size: 0.85rem; }
+.context { background: var(--accent); border-radius: 8px; padding: 1rem; margin: 1rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+
+<h1>Closing the 42× Gap to QR Leaderboard #1</h1>
+<p class="subtitle">GPU MODE QR Competition — B200 | June 16, 2026 | V11 at 29.8ms vs #1 at 704μs</p>
+
+<div class="gap-viz">
+<p><strong>Performance Gap Visualization (log scale, geomean μs)</strong></p>
+<div class="gap-bar" style="width:100%"><div class="fill" style="width:100%; background: linear-gradient(90deg, var(--highlight) 0%, var(--highlight) 2.4%, transparent 2.4%)"></div><span class="label">#1: 704μs (2.4%)</span></div>
+<div class="gap-bar" style="width:100%"><div class="fill" style="width:100%; background: linear-gradient(90deg, var(--green) 0%, var(--green) 100%, transparent 100%)"></div><span class="label">V11: 29,825μs (100%)</span></div>
+<p style="margin-top:1rem; font-size:0.85rem; color:var(--dim);">Target: reduce geomean by 42×. Critical shape (640,512) at 619ms dominates — needs ~880× improvement to match #1's extrapolated performance.</p>
+</div>
+
+<h2>Grounding Context</h2>
+<div class="context">
+<strong>What we know about #1 (704μs):</strong> Must be using fully device-side QR with zero cuSOLVER/cuBLAS library calls. At 704μs geomean across 12 shapes including batch=640 n=512, they process ~57B FP32 flops in under 1ms. This implies tensor-core math (TF32 or FP16 accumulation) for the trailing update and a fused panel kernel that eliminates all inter-kernel memory traffic.<br><br>
+<strong>What's failed:</strong> Custom serial-column panel kernels (slower than cuSOLVER), custom V/T kernels (slower than ATen loops), nb=64 (correctness fails), TF32 (correctness fails on stressed matrices).<br><br>
+<strong>B200 specs:</strong> 227KB shared memory/SM, 108 SMs, ~2TB/s HBM bandwidth, ~180 TFLOPS FP32, ~720 TFLOPS TF32 tensor core.<br><br>
+<strong>Topic axes:</strong> Panel factorization | Trailing update | Memory hierarchy | Algorithm alternatives | GPU parallelism
+</div>
+
+<h2>Top Ideas (Ranked)</h2>
+
+<div class="idea top">
+<h4>1. Cooperative Multi-Warp Panel with Column-Parallel Reflection</h4>
+<span class="axis">Panel factorization</span> <span class="axis">GPU parallelism</span>
+<p>Instead of processing panel columns sequentially (one warp-reduce per column), use <strong>multiple warps cooperating on each column</strong> and overlap the norm computation of column j+1 with the reflection application of column j. Assign 8 warps (256 threads) per panel, with warps 0-3 handling the current reflection while warps 4-7 pre-compute the next column's norm. This halves the effective serial depth.</p>
+<p class="basis">external: MAGMA's dgeqr2 batched kernel (Abdelfattah 2022) achieves 16-25× over cuBLAS using exactly this cooperative multi-warp panel with overlapped norm/reflection. The paper explicitly states "the panel kernels contribute significantly to total execution time" and "kernel fusion" of norm+reflection is the key optimization.</p>
+<p class="impact">Expected: 5-10× speedup on panel-dominated shapes. For (640,512), panel factorization is ~40% of iteration time.</p>
+</div>
+
+<div class="idea top">
+<h4>2. CUDA Graphs Capturing the Entire Block Loop</h4>
+<span class="axis">GPU parallelism</span> <span class="axis">Memory hierarchy</span>
+<p>The (640,512) shape has <strong>fixed geometry</strong> — every submission sees the same batch/n. Capture the entire 16-iteration block loop as a CUDA graph during the first call: all kernel launches, cuBLAS calls, and memory operations become a single graph replay. Eliminates ~500+ individual kernel launch overheads (each ~5-10μs on B200) per QR factorization. The graph also enables the driver to optimize memory reuse and scheduling across iterations.</p>
+<p class="basis">external: GPU MODE NVFP4 winners noted that kernel launch overhead dominated for memory-bound shapes. PyTorch's `torch.cuda.CUDAGraph` API captures arbitrary streams. The (640,512) shape repeats 200+ times in benchmark mode with identical dimensions — perfect for graph replay.</p>
+<p class="impact">Expected: 2-5× from eliminating launch overhead. At ~500 launches × 5μs = 2.5ms overhead alone — comparable to the target 704μs!</p>
+</div>
+
+<div class="idea top">
+<h4>3. CholeskyQR2 with Direct Compact-Householder Output</h4>
+<span class="axis">Algorithm alternatives</span> <span class="axis">GPU parallelism</span>
+<p>Replace Householder QR entirely with <strong>CholeskyQR2</strong>: compute Q via A^T·A → Cholesky → back-solve, then re-orthogonalize once for stability. The critical insight: the algorithm is <strong>embarrassingly parallel</strong> — the GEMM A^T·A fully saturates the GPU (no column-by-column serial dependency). Convert the resulting Q,R back to compact Householder form (H,tau) via a single additional geqrf on R (which is nb×nb, trivially fast). Two GEMM + one tiny geqrf vs 16 sequential panel+trailing iterations.</p>
+<p class="basis">reasoned: Householder QR's serial column dependency is the fundamental bottleneck — each column must wait for all prior reflections. CholeskyQR2 replaces this with 2× GEMM (fully parallel, tensor-core friendly) + Cholesky (trivial for n×n) + back-solve. The condition-number-squaring issue is handled by the "2" (two iterations). For well-conditioned matrices (most benchmark cases have cond≤4), even one iteration suffices.</p>
+<p class="impact">Expected: 10-50× by converting from latency-bound serial algorithm to throughput-bound parallel GEMM. The A^T·A GEMM for batch=640, n=512 is a batched 512×512 SGEMM — exactly what tensor cores are designed for.</p>
+</div>
+
+<div class="idea top">
+<h4>4. Fused Panel Kernel with Shared-Memory Ring Buffer</h4>
+<span class="axis">Panel factorization</span> <span class="axis">Memory hierarchy</span>
+<p>Write a single CUDA kernel that handles the entire blocked QR for one batch matrix. The panel (m×nb=512×32) lives in shared memory. After factoring the panel in-place, the kernel <strong>does not exit</strong> — it directly applies the WY trailing update by streaming trailing matrix tiles through shared memory in a ring buffer pattern. V and T never leave shared memory. Each thread-block handles one batch matrix's entire QR, making (640,512) = 640 thread-blocks running in parallel.</p>
+<p class="basis">direct: MAGMA paper Section 8 "Big Picture": "The fused panel and update kernels can be used to factorize the entire matrix, without utilizing the batch dgemm kernel." For n≤512 with 64KB panels fitting in B200's 227KB SMEM (leaving 163KB for trailing tiles), this is feasible.</p>
+<p class="impact">Expected: 10-20× by eliminating all inter-kernel global memory traffic and cuBLAS overhead. All 16 block steps fuse into one persistent kernel per batch matrix.</p>
+</div>
+
+<div class="idea top">
+<h4>5. Mixed-Precision Panel (FP16 Reflection + FP32 Accumulation)</h4>
+<span class="axis">Panel factorization</span> <span class="axis">Trailing update</span>
+<p>Compute Householder reflections in FP16 for the dot products and column updates (2× throughput, half the SMEM footprint) but accumulate norms and tau in FP32. The trailing GEMM uses TF32 tensor cores. Key insight: the <strong>output must be FP32</strong> but internal computation need not be — as long as the final H,tau values satisfy the residual tolerance. The tolerance is rtol=20·n·eps32 which allows significant intermediate rounding.</p>
+<p class="basis">external: MixedPrecisionBlockQR (GitHub: jaidonlybbert) demonstrates FP16 trailing GEMM with FP32 panel achieving full FP32-quality output. The NVFP4 competition winners showed that mixed-precision with careful accumulation can match full-precision results. V3's experiment showed TF32 trailing failed on stressed matrices — but that was with nb=64; nb=32 + FP16 panel with FP32 accumulation at critical steps may pass.</p>
+<p class="impact">Expected: 2-4× from doubling compute throughput and halving SMEM usage (allowing larger tiles or higher occupancy).</p>
+</div>
+
+<div class="idea">
+<h4>6. Direct cuSOLVER Batched API (Bypass ATen Dispatch)</h4>
+<span class="axis">Panel factorization</span> <span class="axis">GPU parallelism</span>
+<p>Call <code>cusolverDnSgeqrfBatched</code> directly with array-of-pointers interface instead of <code>at::geqrf</code>. ATen's geqrf may not use the optimal batched path for our specific shapes — it might dispatch to per-matrix geqrf sequentially. The array-of-pointers batched API processes all 640 matrices in a single library call with internal parallelism.</p>
+<p class="basis">reasoned: `at::geqrf` on a 3D tensor may internally loop over batch elements calling single-matrix geqrf, or may use cuSOLVER batched. The API choice matters for batch=640 — the batched version launches one internal kernel for all matrices. Worth verifying which path ATen takes and forcing the optimal one.</p>
+<p class="impact">Expected: 2-5× if ATen is not already using the batched path. Easy to verify.</p>
+</div>
+
+<div class="idea">
+<h4>7. Tall-Skinny QR via Communication-Avoiding TSQR</h4>
+<span class="axis">Algorithm alternatives</span> <span class="axis">GPU parallelism</span>
+<p>For the block panels (512×32), use TSQR (Tall-Skinny QR): split the 512-row panel into 16 tiles of 32×32 each, QR-factor each tile independently (fully parallel!), then merge pairwise in a reduction tree. Each 32×32 tile factorization uses the proven V11 fused kernel. The tree merge is log2(16)=4 levels of small QR on 64×32 matrices.</p>
+<p class="basis">external: TSQR (Demmel et al. 2012) is the communication-avoiding algorithm for tall-skinny QR. It replaces the n-step serial Householder with a log(m/n)-deep reduction tree. For 512×32: 16 parallel 32×32 factorizations + 4 levels of 64×32 merges. Each V11's fused kernel handles the 32×32 base cases in ~6μs.</p>
+<p class="impact">Expected: 5-8× on panel-dominated portion by parallelizing the inherently serial panel factorization.</p>
+</div>
+
+<h2>Additional Promising Ideas</h2>
+
+<div class="idea">
+<h4>8. Warp-Specialized Persistent Kernel (Producer-Consumer)</h4>
+<span class="axis">Memory hierarchy</span> <span class="axis">GPU parallelism</span>
+<p>Use Blackwell's warp specialization: dedicate 4 warps to panel factorization (producer) and 4 warps to trailing update (consumer), communicating through shared memory barriers. The producer completes a panel column and signals the consumer, which immediately starts applying reflectors to trailing columns while the producer moves to the next column. Pipelined execution hides panel latency behind trailing compute.</p>
+<p class="basis">external: Modular's Blackwell GEMM blog shows warp specialization achieving 85% of SOTA. GPU MODE NVFP4 winners used dedicated TMA and tensor core warps. Same pattern applies: panel warp produces V/tau, trailing warp consumes.</p>
+</div>
+
+<div class="idea">
+<h4>9. Per-Shape Kernel Specialization via Template Metaprogramming</h4>
+<span class="axis">GPU parallelism</span> <span class="axis">Panel factorization</span>
+<p>Since the benchmark shapes are known (only 7 unique n values), compile <strong>7 specialized kernels at module load</strong> — each with n, nb, thread count, and SMEM layout hardcoded as template parameters. The compiler unrolls the inner loops, eliminates conditionals, and maps directly to registers. The Python dispatch is a simple switch on n.</p>
+<p class="basis">reasoned: The fused_qr_small kernel in V11 uses runtime `n` — the compiler can't unroll the column loop. Template-specializing for n=32, 176, 352, 512 lets the compiler generate perfectly tuned code per shape. The compilation cost is 7×, but within the 240s budget (V11's single kernel compiles in ~18s).</p>
+</div>
+
+<div class="idea">
+<h4>10. Batched 3-Stage Pipeline: Panel → V/T → Trailing (Overlapped)</h4>
+<span class="axis">GPU parallelism</span> <span class="axis">Trailing update</span>
+<p>For (640,512) with 16 block steps, pipeline across batch elements: while batch[0..213] is in the trailing update of step k, batch[214..427] is in V/T construction of step k, and batch[428..639] is in panel factorization of step k+1. Three concurrent streams, each occupying 1/3 of the SMs. Eliminates the serial dependency between panel and trailing across different batch elements.</p>
+<p class="basis">reasoned: The serial dependency (panel→V/T→trailing) exists within each batch matrix, but different batch elements are independent. With batch=640 and 108 SMs on B200, we have enough parallelism to pipeline stages. Multi-stream execution overlap is native to CUDA.</p>
+</div>
+
+<h2>Rejected Ideas (with reasons)</h2>
+
+<div class="rejected">
+<h4>torch.compile for the block loop</h4>
+<p class="reason">V7/V8 proved this times out (>300s compilation). The compiler can't fuse across geqrf boundaries anyway.</p>
+</div>
+
+<div class="rejected">
+<h4>nb=64 for fewer iterations</h4>
+<p class="reason">V10 proved this fails correctness on ill-conditioned matrices. The TF32 error accumulates across larger GEMM inner products.</p>
+</div>
+
+<div class="rejected">
+<h4>Pure register-based kernel for n=512</h4>
+<p class="reason">512 floats per row × 512 rows = 1MB; register file is ~256KB per SM. Physically impossible without blocking.</p>
+</div>
+
+<div class="rejected">
+<h4>Triton kernel</h4>
+<p class="reason">Triton doesn't support Householder QR's control flow (column-by-column dependencies with conditional pivoting). Its block-oriented model doesn't map to the reduction-heavy panel factorization pattern.</p>
+</div>
+
+<div class="rejected">
+<h4>cuSOLVERDx</h4>
+<p class="reason">Probed on Popcorn B200 — headers not installed. Not available in the competition environment.</p>
+</div>
+
+<h2>Recommended Next Steps</h2>
+<table>
+<tr><th>Priority</th><th>Idea</th><th>Effort</th><th>Expected Impact</th></tr>
+<tr><td>1</td><td><strong>CholeskyQR2</strong> (#3) — fundamentally different algorithm</td><td>Medium (1-2 days)</td><td>10-50× if numerics work</td></tr>
+<tr><td>2</td><td><strong>CUDA Graphs</strong> (#2) — captures block loop</td><td>Low (hours)</td><td>2-5× from launch overhead elimination</td></tr>
+<tr><td>3</td><td><strong>Fused Panel Ring Buffer</strong> (#4) — persistent kernel</td><td>High (2-3 days)</td><td>10-20× on critical shape</td></tr>
+<tr><td>4</td><td><strong>Direct cuSOLVER Batched API</strong> (#6) — quick verification</td><td>Low (hours)</td><td>2-5× if ATen not using batched path</td></tr>
+<tr><td>5</td><td><strong>Multi-Warp Cooperative Panel</strong> (#1) — improved V10</td><td>Medium</td><td>5-10× on panel portion</td></tr>
+</table>
+
+<p style="margin-top: 2rem; color: var(--dim); font-size: 0.85rem;">
+Generated June 16, 2026. Based on V0-V11 experiments, MAGMA batched QR paper (Abdelfattah 2022), GPU MODE NVFP4 hackathon winner analyses, and cuSOLVERDx documentation. The 42× gap requires an algorithmic shift — not incremental optimization of the current Householder + cuSOLVER stack.
+</p>
+
+</body>
+</html>
