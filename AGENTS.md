@@ -129,7 +129,13 @@ git status   # operates on qrproblem's own .git
 
 ## Results Tracking
 
-Every leaderboard submission must have its geometric mean score recorded in the Results Log table in `experiment_plan.md`. Capture the per-shape timings from the Popcorn output and compute the geometric mean across all benchmark shapes.
+**Log every experiment result immediately** after obtaining benchmark timings — whether from Modal or Popcorn. Do not defer logging; results must be captured in the same commit as the code change.
+
+For each experiment, add a row to the Results Log table in `experiment_plan.md` with:
+- All per-shape timings (μs) from the benchmark output
+- Computed geometric mean (7-shape and/or 12-shape)
+- LB rank or submission status
+- Key observations (what improved, what regressed, why)
 
 ## Key Constraints
 
