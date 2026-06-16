@@ -118,6 +118,15 @@ The Modal test script (`modal_test.py`) should:
 
 Use Popcorn only for final leaderboard submissions after Modal testing confirms correctness and promising timings.
 
+## Git
+
+This folder (`qrproblem/`) has its own standalone git repository (separate from the parent `kaggle/` repo). All git operations should run inside this directory, not the parent.
+
+```bash
+cd /Users/phani/Work/Adhoc/kaggle/qrproblem
+git status   # operates on qrproblem's own .git
+```
+
 ## Key Constraints
 
 - Single Python file submission
