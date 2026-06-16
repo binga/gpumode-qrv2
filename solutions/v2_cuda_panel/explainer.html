@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V2: CUDA Inline Panel Kernel + cuBLAS Trailing Update</title>
+<style>
+  :root {
+    --bg: #0a0e17; --surface: #131a2b; --border: #1e2d4a;
+    --text: #c9d1d9; --text-dim: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --code-bg: #161b22; --font: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 1.8rem; color: #fff; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.2rem; color: var(--accent); margin: 2rem 0 0.8rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+  .badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600; margin-left: 0.5rem; }
+  .badge-cuda { background: var(--green); color: #000; }
+  .subtitle { color: var(--text-dim); margin-bottom: 2rem; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; margin: 1rem 0; }
+  .card-title { font-weight: 600; color: #fff; margin-bottom: 0.5rem; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-family: var(--font); font-size: 0.8rem; line-height: 1.5; margin: 0.8rem 0; }
+  code { font-family: var(--font); font-size: 0.85rem; }
+  .ic { background: var(--code-bg); padding: 0.15rem 0.4rem; border-radius: 4px; }
+  .note { border-left: 3px solid var(--yellow); padding: 0.8rem 1rem; background: rgba(210, 153, 34, 0.08); border-radius: 0 6px 6px 0; margin: 1rem 0; font-size: 0.9rem; }
+  .good { border-left: 3px solid var(--green); padding: 0.8rem 1rem; background: rgba(63, 185, 80, 0.08); border-radius: 0 6px 6px 0; margin: 1rem 0; font-size: 0.9rem; }
+  .arch-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+  .arch-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+  .arch-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent); margin-bottom: 0.5rem; }
+  .diagram { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1rem 0; font-family: var(--font); font-size: 0.8rem; line-height: 1.8; overflow-x: auto; white-space: pre; color: var(--text-dim); }
+  .highlight { color: var(--accent); font-weight: 600; }
+  .highlight-green { color: var(--green); font-weight: 600; }
+  .highlight-yellow { color: var(--yellow); font-weight: 600; }
+  .highlight-red { color: var(--red); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; margin: 0.8rem 0; font-size: 0.85rem; }
+  th, td { padding: 0.5rem 0.8rem; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--accent); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  @media (max-width: 640px) { .arch-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<h1>V2: CUDA Panel Kernel <span class="badge badge-cuda">CUDA</span></h1>
+<p class="subtitle">Custom CUDA kernel for panel factorization + cuBLAS GEMM for trailing update.</p>
+
+<h2>Architecture Split</h2>
+<div class="arch-grid">
+  <div class="arch-box">
+    <div class="arch-label">Panel Factorization</div>
+    <div class="card-title">Custom CUDA Kernel</div>
+    <p style="font-size: 0.9rem;">Memory-bound, sequential within each column. Multiple threads cooperate on norms and reflector application via shared memory reductions.</p>
+    <p style="font-size: 0.8rem; color: var(--text-dim); margin-top: 0.5rem;">One thread-block per batch matrix. 256 threads per block. Shared memory for partial sums.</p>
+  </div>
+  <div class="arch-box">
+    <div class="arch-label">Trailing Update</div>
+    <div class="card-title">cuBLAS Batched GEMM</div>
+    <p style="font-size: 0.9rem;">Compute-bound. Two batched matrix multiplies with TF32 tensor cores on B200. Already near-optimal via cuBLAS.</p>
+    <p style="font-size: 0.8rem; color: var(--text-dim); margin-top: 0.5rem;"><code class="ic">torch.bmm</code> dispatches to <code class="ic">cublasGemmStridedBatched</code> with TF32.</p>
+  </div>
+</div>
+
+<h2>Panel Kernel: Thread Cooperation Model</h2>
+<div class="diagram">
+  Thread block for one matrix (n=512, 256 threads):
+
+  Column j processing:
+
+  <span class="highlight">Step 1: Column norm</span> (parallel reduction)
+  ┌─────────────────────────────────────────────┐
+  │ T0: sum a[j+1]²+a[j+257]²   → partial[0]  │
+  │ T1: sum a[j+2]²+a[j+258]²   → partial[1]  │
+  │ ...                                          │
+  │ T255: sum a[j+256]²+a[j+512]²→ partial[255]│
+  │                                              │
+  │ Reduce: partial[0] += partial[128]           │
+  │         partial[0] += partial[64]  ...       │
+  │         → σ² = partial[0]                    │
+  └─────────────────────────────────────────────┘
+
+  <span class="highlight">Step 2: Householder vector</span> (thread 0 only)
+  ┌─────────────────────────────────────────────┐
+  │ v₀ = x₀ + sign(x₀)·√(x₀² + σ²)           │
+  │ τⱼ = 2 / (v₀² + σ²)                        │
+  │ Store: a[j,j] = -sign(x₀)·‖x‖              │
+  └─────────────────────────────────────────────┘
+
+  <span class="highlight">Step 3: Normalize + apply</span> (all threads)
+  ┌─────────────────────────────────────────────┐
+  │ Normalize: a[i,j] /= v₀  (parallel)        │
+  │                                              │
+  │ For each column k = j+1 .. col_end-1:       │
+  │   dot = <span class="highlight-green">parallel reduce</span>(vᵀ · A[:,k])        │
+  │   A[:,k] -= τⱼ · dot · v  (parallel)        │
+  └─────────────────────────────────────────────┘
+
+  __syncthreads() between each phase
+</div>
+
+<h2>Key Design Decisions</h2>
+<table>
+  <tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr>
+  <tr>
+    <td>Threads per block</td>
+    <td><code class="ic">min(256, ceil(n/32)*32)</code></td>
+    <td>256 threads handle n=512 with 2 rows per thread. Warp-aligned for efficient reductions.</td>
+  </tr>
+  <tr>
+    <td>One block per batch</td>
+    <td>blocks = batch_size</td>
+    <td>batch=640 saturates B200's 148 SMs (~4.3× occupancy). No need for multi-block per matrix.</td>
+  </tr>
+  <tr>
+    <td>Shared memory layout</td>
+    <td><code class="ic">2 × nthreads × float</code></td>
+    <td>Two arrays: partial sums for norm, dot products for reflector application. 2KB for 256 threads.</td>
+  </tr>
+  <tr>
+    <td>Panel applies to panel only</td>
+    <td>Columns j..j+nb</td>
+    <td>Trailing columns updated via GEMM (next step). Panel kernel only touches its own nb columns.</td>
+  </tr>
+  <tr>
+    <td>TF32 in trailing GEMM</td>
+    <td><code class="ic">allow_tf32 = True</code></td>
+    <td>~2× throughput. 10-bit mantissa is sufficient — tolerance is 20·n·eps32.</td>
+  </tr>
+</table>
+
+<h2>Compilation</h2>
+<div class="card">
+  <p>The CUDA kernel is compiled at runtime via <code class="ic">torch.utils.cpp_extension.load_inline</code>. First call compiles (~10-30s), subsequent calls use the cached <code class="ic">.so</code>.</p>
+  <pre>_kernel = load_inline(
+    name="qr_v3",
+    cuda_sources=[cuda_src],
+    functions=["blocked_qr"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_ldflags=["-lcublas"],
+)</pre>
+</div>
+
+<div class="note">
+  <strong>Risk:</strong> Compilation time on Popcorn's B200 instances may eat into the 240s test timeout. The <code class="ic">--use_fast_math</code> flag trades strict IEEE compliance for speed — acceptable given the competition's generous tolerances, but could cause issues on near-collinear or clustered-scale inputs. Monitor test results.
+</div>
+
+<h2>Correctness Considerations</h2>
+<div class="card">
+  <ul style="margin-left: 1.5rem;">
+    <li><strong>LAPACK convention:</strong> The kernel must produce the same compact format as <code class="ic">torch.geqrf</code> — R in upper triangle of H, Householder vectors below diagonal with implicit v[j]=1, tau as reflector coefficients.</li>
+    <li><strong>Sign convention:</strong> <code class="ic">r_jj = -sign(x₀)·‖x‖</code>. Getting the sign wrong produces valid QR but doesn't match <code class="ic">householder_product</code>'s reconstruction, causing the checker to fail.</li>
+    <li><strong>Numerical stability:</strong> <code class="ic">sigma_sq > 1e-30f</code> guard prevents division by zero for zero columns. The <code class="ic">v₀</code> computation uses the numerically stable form (add sign·norm instead of subtract).</li>
+    <li><strong>TF32 in trailing GEMM:</strong> Only affects the trailing matrix update, not the panel factorization. Panel runs in full FP32 — this is where numerical precision matters most.</li>
+  </ul>
+</div>
+
+<h2>Expected Performance</h2>
+<div class="card">
+  <div class="card-title">Untested — requires B200</div>
+  <p>This version has not been benchmarked on B200 yet. Expected improvement comes from:</p>
+  <ul style="margin: 0.5rem 0 0 1.5rem;">
+    <li>Eliminating PyTorch dispatch overhead in the panel (no Python-to-C++ crossing per column)</li>
+    <li>Cooperative thread parallelism for column norms and reflector application</li>
+    <li>TF32 tensor cores in trailing GEMM (~2× throughput over FP32)</li>
+  </ul>
+  <p style="margin-top: 0.5rem;">The V/T construction still uses PyTorch tensor operations (Python loops, indexing). Fusing this into the CUDA kernel is the next optimization target.</p>
+</div>
+
+<div class="good">
+  <strong>What's next:</strong> Fuse V/T construction into the panel kernel. Use cuBLAS directly (via C++ handle) instead of <code class="ic">torch.bmm</code>. Size-adaptive dispatch: cuSOLVER for small n, this kernel for medium, multi-block cooperative for large.
+</div>
+
+</body>
+</html>

@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V1: Blocked Householder with WY Trailing Update</title>
+<style>
+  :root {
+    --bg: #0a0e17; --surface: #131a2b; --border: #1e2d4a;
+    --text: #c9d1d9; --text-dim: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --code-bg: #161b22; --font: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 1.8rem; color: #fff; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.2rem; color: var(--accent); margin: 2rem 0 0.8rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+  h3 { font-size: 1rem; color: #fff; margin: 1.2rem 0 0.5rem; }
+  .badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600; margin-left: 0.5rem; }
+  .badge-opt { background: var(--accent); color: #000; }
+  .subtitle { color: var(--text-dim); margin-bottom: 2rem; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; margin: 1rem 0; }
+  .card-title { font-weight: 600; color: #fff; margin-bottom: 0.5rem; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-family: var(--font); font-size: 0.85rem; line-height: 1.5; margin: 0.8rem 0; }
+  code { font-family: var(--font); font-size: 0.85rem; }
+  .ic { background: var(--code-bg); padding: 0.15rem 0.4rem; border-radius: 4px; }
+  .note { border-left: 3px solid var(--yellow); padding: 0.8rem 1rem; background: rgba(210, 153, 34, 0.08); border-radius: 0 6px 6px 0; margin: 1rem 0; font-size: 0.9rem; }
+  .good { border-left: 3px solid var(--green); padding: 0.8rem 1rem; background: rgba(63, 185, 80, 0.08); border-radius: 0 6px 6px 0; margin: 1rem 0; font-size: 0.9rem; }
+  .step-grid { display: grid; grid-template-columns: 1fr; gap: 0; margin: 1rem 0; }
+  .step { display: flex; gap: 1rem; padding: 1rem; border: 1px solid var(--border); background: var(--surface); }
+  .step:first-child { border-radius: 8px 8px 0 0; }
+  .step:last-child { border-radius: 0 0 8px 8px; }
+  .step + .step { border-top: none; }
+  .step-num { width: 32px; height: 32px; background: var(--accent); color: #000; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.85rem; flex-shrink: 0; }
+  .step-content { flex: 1; }
+  .step-title { font-weight: 600; color: #fff; }
+  .math { font-family: 'Times New Roman', serif; font-style: italic; font-size: 1.05em; color: #fff; }
+  .diagram { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1rem 0; font-family: var(--font); font-size: 0.8rem; line-height: 1.8; overflow-x: auto; white-space: pre; color: var(--text-dim); }
+  .highlight { color: var(--accent); font-weight: 600; }
+  .highlight-green { color: var(--green); font-weight: 600; }
+  .highlight-yellow { color: var(--yellow); font-weight: 600; }
+  .metric-row { display: flex; gap: 1rem; margin: 1rem 0; flex-wrap: wrap; }
+  .metric { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; text-align: center; flex: 1; min-width: 140px; }
+  .metric-value { font-size: 1.4rem; font-weight: 700; color: #fff; }
+  .metric-label { font-size: 0.8rem; color: var(--text-dim); margin-top: 0.3rem; }
+</style>
+</head>
+<body>
+
+<h1>V1: Blocked Householder <span class="badge badge-opt">optimization</span></h1>
+<p class="subtitle">Panel factorization via <code class="ic">torch.geqrf</code> + WY trailing update via batched GEMM.</p>
+
+<h2>Key Idea</h2>
+<div class="card">
+  <p>Instead of applying each Householder reflection immediately to <em>all</em> remaining columns (n rank-1 updates), we <strong>accumulate</strong> a block of <code class="ic">nb=32</code> reflections and apply them in one shot as a matrix multiply.</p>
+  <p style="margin-top: 0.5rem;">The rank-1 updates are <strong>memory-bound</strong> (low arithmetic intensity). The batched GEMM is <strong>compute-bound</strong> and can use tensor cores. This is the fundamental insight behind every fast QR implementation on GPU.</p>
+</div>
+
+<h2>Algorithm: Block-by-Block</h2>
+
+<div class="diagram">
+  Matrix A (n=512, nb=32 → 16 block steps):
+
+  <span class="highlight">Panel</span>        <span class="highlight-green">Trailing matrix</span>
+  ┌──┬─────────────────┐
+  │<span class="highlight">██</span>│<span class="highlight-green">▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒</span>│  Step 1: Factor cols 0-31,
+  │<span class="highlight">██</span>│<span class="highlight-green">▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒</span>│          update cols 32-511
+  │<span class="highlight">██</span>│<span class="highlight-green">▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒</span>│
+  │<span class="highlight">██</span>│<span class="highlight-green">▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒</span>│
+  ├──┼──┬──────────────┤
+  │RR│<span class="highlight">██</span>│<span class="highlight-green">▒▒▒▒▒▒▒▒▒▒▒▒▒▒</span>│  Step 2: Factor cols 32-63,
+  │  │<span class="highlight">██</span>│<span class="highlight-green">▒▒▒▒▒▒▒▒▒▒▒▒▒▒</span>│          update cols 64-511
+  │  │<span class="highlight">██</span>│<span class="highlight-green">▒▒▒▒▒▒▒▒▒▒▒▒▒▒</span>│
+  ├──┼──┼──┬───────────┤
+  │RR│RR│<span class="highlight">██</span>│<span class="highlight-green">▒▒▒▒▒▒▒▒▒▒▒</span>│  Step 3: ...
+  │  │  │<span class="highlight">██</span>│<span class="highlight-green">▒▒▒▒▒▒▒▒▒▒▒</span>│
+  └──┴──┴──┴───────────┘
+
+  <span class="highlight">██</span> = Panel (sequential, memory-bound)
+  <span class="highlight-green">▒▒</span> = Trailing update (parallel GEMM, tensor cores)
+  RR = Already factored (R in upper triangle)
+</div>
+
+<h2>The Three Steps Per Block</h2>
+
+<div class="step-grid">
+  <div class="step">
+    <div class="step-num">1</div>
+    <div class="step-content">
+      <div class="step-title">Panel Factorization</div>
+      <p>Factor columns <code class="ic">j</code> to <code class="ic">j+nb</code> using <code class="ic">torch.geqrf</code> on the panel submatrix. This produces Householder vectors V and scalars τ. Still sequential column-by-column, but only <code class="ic">nb</code> columns instead of all <code class="ic">n</code>.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-content">
+      <div class="step-title">Build WY Compact Form</div>
+      <p>Accumulate the <code class="ic">nb</code> reflections into the WY representation: the block reflector is <span class="math">I − V T V<sup>T</sup></span> where <strong>T</strong> is an <code class="ic">nb×nb</code> upper triangular matrix. T is built column-by-column — cheap since nb is small (32).</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">3</div>
+    <div class="step-content">
+      <div class="step-title">Trailing Update via GEMM</div>
+      <p>Apply the block reflector to the trailing matrix:<br>
+      <span class="math">A[j:, j+nb:] −= V · T · V<sup>T</sup> · A[j:, j+nb:]</span><br>
+      This decomposes into two batched matrix multiplies — the compute-bound heart of the algorithm. With TF32 tensor cores on B200, this runs at ~2× the throughput of FP32.</p>
+    </div>
+  </div>
+</div>
+
+<h2>The WY Representation</h2>
+<div class="card">
+  <p>The key data structure. Given <code class="ic">nb</code> Householder reflectors <span class="math">H<sub>j</sub> = I − τ<sub>j</sub> v<sub>j</sub> v<sub>j</sub><sup>T</sup></span>, their product is:</p>
+  <p style="margin: 0.8rem 0; text-align: center;"><span class="math">H<sub>1</sub> H<sub>2</sub> ··· H<sub>nb</sub> = I − V T V<sup>T</sup></span></p>
+  <p>where <strong>V</strong> = [v<sub>1</sub>, v<sub>2</sub>, ..., v<sub>nb</sub>] and <strong>T</strong> is <code class="ic">nb×nb</code> upper triangular, built recursively:</p>
+  <pre>T[j, j] = τ[j]
+T[0:j, j] = −τ[j] · T[0:j, 0:j] @ V[:, 0:j]ᵀ @ V[:, j]</pre>
+  <p style="margin-top: 0.5rem;">This converts <code class="ic">nb</code> sequential rank-1 updates into two GEMMs — <strong>the fundamental speedup</strong>.</p>
+</div>
+
+<h2>Implementation</h2>
+<pre>def _blocked_qr(A, nb=32):
+    batch, n, _ = A.shape
+    H = A.clone()
+    tau_all = torch.zeros(batch, n)
+
+    for j in range(0, n, nb):
+        actual_nb = min(nb, n - j)
+
+        # 1. Panel factorization
+        panel = H[:, j:, j:j+actual_nb].contiguous()
+        panel_h, panel_tau = torch.geqrf(panel)
+        H[:, j:, j:j+actual_nb] = panel_h
+        tau_all[:, j:j+actual_nb] = panel_tau
+
+        # 2. Build V and T
+        V = _build_V(panel_h, actual_nb)
+        T = _build_T(V, panel_tau)
+
+        # 3. Trailing update: H -= V @ T @ V^T @ trailing
+        trailing = H[:, j:, j+actual_nb:].contiguous()
+        W = torch.bmm(V.transpose(1, 2), trailing)  # GEMM 1
+        W = torch.bmm(T, W)                          # small matmul
+        H[:, j:, j+actual_nb:] = trailing - torch.bmm(V, W)  # GEMM 2
+
+    return H, tau_all</pre>
+
+<h2>Performance Profile</h2>
+<div class="metric-row">
+  <div class="metric">
+    <div class="metric-value" style="color: var(--yellow);">TBD</div>
+    <div class="metric-label">Geom Mean (B200)</div>
+  </div>
+  <div class="metric">
+    <div class="metric-value" style="color: var(--green);">19/19</div>
+    <div class="metric-label">Tests Passing (CPU)</div>
+  </div>
+  <div class="metric">
+    <div class="metric-value">nb=32</div>
+    <div class="metric-label">Block Size</div>
+  </div>
+</div>
+
+<div class="note">
+  <strong>CPU result:</strong> ~17% slower than V0 on CPU. Expected — the GEMM advantage only materializes on GPU with tensor cores. The panel extraction + <code class="ic">householder_product</code> reconstruction adds overhead that the GEMM savings need to overcome.
+</div>
+
+<h2>Limitations</h2>
+<div class="card">
+  <ul style="margin-left: 1.5rem;">
+    <li><strong>Panel still uses torch.geqrf</strong> — not a custom kernel. The panel is the sequential bottleneck and needs a fused CUDA kernel (→ V2).</li>
+    <li><strong>V and T built with Python loops</strong> — overhead from tensor indexing and temporary allocations. Should be fused into C++/CUDA.</li>
+    <li><strong>Extra memory allocations</strong> — <code class="ic">clone()</code>, <code class="ic">contiguous()</code>, V and T tensors created each block step.</li>
+  </ul>
+</div>
+
+<div class="good">
+  <strong>What's next (V2):</strong> Replace the panel factorization with a custom CUDA kernel that processes <code class="ic">nb</code> columns in shared memory with cooperative threads, and fuse V/T construction into the kernel. The trailing GEMM stays as cuBLAS — it's already optimal.
+</div>
+
+</body>
+</html>
