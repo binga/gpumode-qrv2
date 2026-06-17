@@ -111,6 +111,7 @@ modal shell --gpu a100
 ```
 
 The Modal test script (`modal_test.py`) should:
+
 1. Upload `submission.py`, `task.py`, `reference.py`, `eval.py`, `utils.py`
 2. Run the correctness checker on a GPU
 3. Report per-shape timings
@@ -129,9 +130,10 @@ git status   # operates on qrproblem's own .git
 
 ## Results Tracking
 
-**Log every experiment result immediately** after obtaining benchmark timings — whether from Modal or Popcorn. Do not defer logging; results must be captured in the same commit as the code change.
+**Log every experiment result immediately** after obtaining benchmark timings — from Popcorn. Do not defer logging; results must be captured in the same commit as the code change.
 
 For each experiment, add a row to the Results Log table in `experiment_plan.md` with:
+
 - All per-shape timings (μs) from the benchmark output
 - Computed geometric mean (7-shape and/or 12-shape)
 - LB rank or submission status
