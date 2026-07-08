@@ -16,15 +16,15 @@ from pathlib import Path
 
 app = modal.App("qr-kernel-test")
 
-cuda_version = "12.4.0"
+cuda_version = "13.0.0"
 flavor = "devel"
-os_version = "ubuntu22.04"
+os_version = "ubuntu24.04"
 cuda_tag = f"{cuda_version}-{flavor}-{os_version}"
 
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{cuda_tag}", add_python="3.11")
     .apt_install("ninja-build")
-    .pip_install("torch", "numpy")
+    .pip_install("torch", "numpy", "triton")
     .add_local_file("task.py", remote_path="/root/harness/task.py")
     .add_local_file("reference.py", remote_path="/root/harness/reference.py")
     .add_local_file("utils.py", remote_path="/root/harness/utils.py")
@@ -54,6 +54,16 @@ TEST_CASES = [
     {"batch": 4, "n": 1024, "cond": 4, "seed": 30, "case": "rankdef"},
     {"batch": 4, "n": 1024, "cond": 6, "seed": 31, "case": "clustered"},
     {"batch": 2, "n": 2048, "cond": 4, "seed": 32, "case": "band"},
+    # High-batch 512 stress (matches leaderboard benchmark conditions)
+    {"batch": 640, "n": 512, "cond": 2, "seed": 1029, "case": "dense"},
+    {"batch": 640, "n": 512, "cond": 0, "seed": 770003, "case": "rankdef"},
+    {"batch": 640, "n": 512, "cond": 0, "seed": 770004, "case": "clustered"},
+    # Intermediate-batch 512 (overlap-triggering but below the Modal batch=640
+    # env artifact that breaks ALL versions including V31 -> used to validate the
+    # two-stream lookahead concurrency correctness).
+    {"batch": 64, "n": 512, "cond": 0, "seed": 5001, "case": "dense"},
+    {"batch": 128, "n": 512, "cond": 0, "seed": 5002, "case": "dense"},
+    {"batch": 256, "n": 512, "cond": 0, "seed": 5003, "case": "dense"},
 ]
 
 BENCHMARK_SHAPES = [
@@ -67,13 +77,17 @@ BENCHMARK_SHAPES = [
 ]
 
 
-@app.function(image=image, gpu="A100", timeout=300)
-def run_tests(submission_code: str, run_benchmark: bool = False, benchmark_repeats: int = 10):
-    """Run correctness tests and optional benchmark on Modal A100."""
+@app.function(image=image, gpu="B200", timeout=600)
+def run_tests(submission_code: str, run_benchmark: bool = False, benchmark_repeats: int = 10, debug: bool = False):
+    """Run correctness tests and optional benchmark on Modal B200."""
     import sys
     import os
     sys.path.insert(0, "/root/harness")
     os.chdir("/root/harness")
+
+    if debug:
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+        os.environ["TRITON_INTERPRET"] = "0"
 
     with open("/root/harness/submission.py", "w") as f:
         f.write(submission_code)
@@ -134,8 +148,10 @@ def run_tests(submission_code: str, run_benchmark: bool = False, benchmark_repea
         results["status"] = "FAIL"
     print(f"\nResult: {results['status']} ({sum(1 for t in results['tests'] if t['status'] == 'PASS')}/{len(TEST_CASES)} passed)")
 
-    # Run benchmark if requested and all tests pass
-    if run_benchmark and all_pass:
+    # Run benchmark if requested. NOTE: batch=640 n=512 correctness fails on
+    # Modal (CUDA13/torch2.12.1) for ALL versions incl. V31 (passes on Popcorn),
+    # so we do NOT gate the benchmark on all_pass anymore.
+    if run_benchmark:
         print()
         print("=" * 60)
         print("BENCHMARK")
@@ -180,7 +196,7 @@ def run_tests(submission_code: str, run_benchmark: bool = False, benchmark_repea
 
 
 @app.local_entrypoint()
-def main(solution: str = "", benchmark: bool = False, repeats: int = 10):
+def main(solution: str = "", benchmark: bool = False, repeats: int = 10, debug: bool = False):
     """Entry point: specify --solution <name> or defaults to ./submission.py"""
     if solution:
         submission_path = Path(f"solutions/{solution}/submission.py")
@@ -193,16 +209,21 @@ def main(solution: str = "", benchmark: bool = False, repeats: int = 10):
 
     print(f"Testing: {submission_path}")
     print(f"Benchmark: {'yes' if benchmark else 'no'}")
-    print(f"Uploading to Modal A100...")
+    print(f"Debug: {'yes' if debug else 'no'}")
+    print(f"Uploading to Modal B200...")
     print()
 
     code = submission_path.read_text()
     start = time.time()
-    results = run_tests.remote(code, run_benchmark=benchmark, benchmark_repeats=repeats)
+    results = run_tests.remote(code, run_benchmark=benchmark, benchmark_repeats=repeats, debug=debug)
     wall_time = time.time() - start
 
     print(f"\n{'=' * 60}")
     print(f"Wall time: {wall_time:.1f}s")
     print(f"Status: {results['status']}")
+    if results.get("error"):
+        print(f"Error: {results['error']}")
+    if results.get("traceback"):
+        print(f"Traceback:\n{results['traceback']}")
     if "geomean_us" in results:
         print(f"Geomean: {results['geomean_us']:.0f}μs ({results['geomean_us']/1000:.2f}ms)")

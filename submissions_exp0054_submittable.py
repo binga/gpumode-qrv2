@@ -624,18 +624,11 @@ std::vector<torch::Tensor> dispatch_qr(torch::Tensor A) {
             auto T_view = T.slice(1, 0, actual_nb).slice(2, 0, actual_nb).contiguous();
 
             if (n <= 512) {
-                // Memory-traffic fusion for the medium trailing update (mirrors
-                // exp_0038/exp_0051 from the n=512 Triton path). Drop the explicit
-                // contiguous() copy of the strided trailing block: feed the strided
-                // view straight to cuBLAS via at::matmul for W1, and fuse the rank-nb
-                // apply + subtract into one in-place baddbmm_ (trailing = 1*trailing
-                // - V@W2) instead of bmm(V,W2) materialization + sub_. All FP32/IEEE
-                // -- numerically identical, removes one full-block alloc+copy and one
-                // full-block intermediate per sub-panel.
-                auto trailing = H.slice(1, j, n).slice(2, j_end, n);
-                auto W1 = at::matmul(V_view.transpose(1,2), trailing);
+                // Proven V22/V24 trailing path for medium/512.
+                auto trailing_c = H.slice(1, j, n).slice(2, j_end, n).contiguous();
+                auto W1 = at::bmm(V_view.transpose(1,2), trailing_c);
                 auto W2 = at::bmm(T_view.transpose(1,2), W1);
-                trailing.baddbmm_(V_view, W2, 1.0, -1.0);
+                H.slice(1, j, n).slice(2, j_end, n).sub_(at::bmm(V_view, W2));
             } else {
                 // n=1024: avoid the large contiguous() copy via strided matmul.
                 auto trailing = H.slice(1, j, n).slice(2, j_end, n);
@@ -902,12 +895,12 @@ def _qr_blocked_lowprec(data: torch.Tensor, nb: int, prec: str) -> output_t:
 # n==2048 path: SUBMITTABLE CholeskyQR2 + Householder-reconstruction.
 #
 # Recovers the -39% (8,2048) win (71.8k -> ~44k us) while staying entirely on
-# the implicit default queue so Popcorn accepts it. Every step uses ONLY
-# (a) hand-written default-queue CUDA kernels and (b) GEMM via torch.matmul/bmm.
+# the default (current) queue so Popcorn accepts it. Every step uses ONLY
+# (a) hand-written current-queue CUDA kernels and (b) GEMM via torch.matmul/bmm.
 # No vendor triangular-solve API, no batched-factorization queue pools, no side
 # queues.
 #   1. G = Q^T Q                          (GEMM via torch.matmul)
-#   2. R = chol(G) (upper, G=R^T R)        BLOCKED: hand-written default-queue
+#   2. R = chol(G) (upper, G=R^T R)        BLOCKED: hand-written current-queue
 #      diagonal-block Cholesky+inverse CUDA kernel + GEMM panel/trailing.
 #      The kernel also emits the per-diagonal-block inverse R_kk^{-1}.
 #   3. Q <- Q R^{-1}                       PURE GEMM: blocked right-solve X R = Q
@@ -915,7 +908,7 @@ def _qr_blocked_lowprec(data: torch.Tensor, nb: int, prec: str) -> output_t:
 #      vendor solver API). (x passes; first pass diagonally shifted so FP32
 #      chol(A^T A) stays PD.)
 #   4. Reconstruct standard (H, tau): M = I - Q*S (S=-sign(diag Q)); no-pivot LU
-#      M = L U via a hand-written default-queue diagonal-block LU+inverse kernel
+#      M = L U via a hand-written current-queue diagonal-block LU+inverse kernel
 #      + GEMM trailing; V=tril(L,-1), tau=2/||v||^2 (genuine reflectors =>
 #      orthogonality gate free), R into triu.
 #
@@ -1144,7 +1137,7 @@ def _cqr_set_prec(mode: str) -> None:
 def _blocked_chol_upper(G: torch.Tensor, nb: int):
     """Right-looking blocked Cholesky: G = R^T R, R upper. G is mutated (trailing
     Schur complement). Diagonal blocks factored + inverted by the custom kernel;
-    panel/trailing updates are cuBLAS GEMMs (default queue). Also returns the
+    panel/trailing updates are cuBLAS GEMMs (current queue). Also returns the
     per-diagonal-block inverses R_kk^{-1} (used for the GEMM right-solve). Raises
     on non-PD."""
     b, n, _ = G.shape
@@ -1170,7 +1163,7 @@ def _rinv_rsolve_blocked(Q: torch.Tensor, R: torch.Tensor, diag_invs, nb: int) -
     """X = Q R^{-1} for upper-tri R, via a blocked right-solve of X R = Q. Forward
     sweep over column blocks: X[:,k] = (Q[:,k] - sum_{j<k} X[:,j] R[j,k]) R[k,k]^{-1},
     where R[k,k]^{-1} comes from the diagonal-block kernel. Pure GEMM
-    (torch.matmul) on the default queue -- no vendor solver API at all."""
+    (torch.matmul) on the current queue -- no vendor solver API at all."""
     b, m, n = Q.shape
     X = torch.empty_like(Q)
     for bi, k in enumerate(range(0, n, nb)):

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>V18 Medium FP32 Panel</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #101522; color: #edf4ff; }
+    main { max-width: 960px; margin: 0 auto; padding: 48px 24px; }
+    h1 { font-size: 40px; margin: 0 0 12px; }
+    h2 { color: #96d7ff; margin-top: 34px; }
+    p, li { color: #c9d6e8; line-height: 1.6; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 18px; }
+    .card { background: #172033; border: 1px solid #2a3957; border-radius: 16px; padding: 18px; }
+    code { color: #ffd28a; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>V18: Medium FP32 Panel</h1>
+  <p>
+    V18 keeps V17's CuTe QR32 path and V13's safe double-precision panel for
+    <code>n=512</code>, but tries a faster FP32 shared-memory panel for the
+    medium benchmark shapes <code>n=176</code> and <code>n=352</code>.
+  </p>
+
+  <h2>Dispatch</h2>
+  <div class="grid">
+    <div class="card"><strong>n = 32</strong><br>CuTe DSL QR32, one warp per matrix, 32x32 tile and tau staged in shared memory.</div>
+    <div class="card"><strong>n <= 352, batch >= 16</strong><br>FP32 fused CUDA panel, then existing ATen WY trailing update.</div>
+    <div class="card"><strong>n = 512, batch >= 16</strong><br>V13 fused CUDA panel with double accumulation, preserving stress-test stability.</div>
+    <div class="card"><strong>Large low-batch shapes</strong><br>Fall back to <code>torch.geqrf</code>, which remains fastest for 1024/2048/4096.</div>
+  </div>
+
+  <h2>Why It Should Help</h2>
+  <p>
+    V13's double-precision panel is robust but more expensive than needed for
+    the dense medium benchmark shapes. V18 tests whether FP32 panel reductions
+    can reduce latency for 176 and 352 without touching the numerically
+    sensitive 512 stress cases.
+  </p>
+</main>
+</body>
+</html>

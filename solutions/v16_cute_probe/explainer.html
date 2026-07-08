@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>V16 CuTe DSL QR32</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0b1020; color: #eef3ff; }
+    main { max-width: 920px; margin: 0 auto; padding: 48px 24px; }
+    h1 { font-size: 42px; margin: 0 0 12px; }
+    h2 { margin-top: 36px; color: #9fd3ff; }
+    p, li { line-height: 1.6; color: #cbd7ee; }
+    .card { border: 1px solid #24304f; border-radius: 18px; padding: 22px; margin: 18px 0; background: rgba(255,255,255,0.045); }
+    .flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-top: 18px; }
+    .step { border-radius: 14px; padding: 16px; background: #121a33; border: 1px solid #2c3a61; }
+    code { color: #ffd38a; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>V16: CuTe DSL QR32</h1>
+  <p>
+    V16 proves that NVIDIA CuTe DSL works inside Popcorn's B200 runner and uses
+    it for a real one-shape QR kernel: shared-memory Householder QR for
+    <code>n=32</code>. Other shapes still fall back to baseline behavior in this
+    probe file, so only the 32x32 timing should be treated as candidate signal.
+  </p>
+
+  <div class="card">
+    <h2>Why This Exists</h2>
+    <p>
+      The existing CUDA small-matrix kernel was already fast at roughly
+      <code>134us</code>, but CuTe's shared-memory version cut that to
+      <code>85.4us</code> while passing all correctness tests. The same
+      submission also keeps a tiny <code>n=512</code> CuTe probe so future
+      trailing-update work can build on a verified runtime path.
+    </p>
+  </div>
+
+  <h2>Execution Flow</h2>
+  <div class="flow">
+    <div class="step"><strong>1. Dispatch</strong><br><code>n=32</code> attempts the CuTe QR32 kernel first.</div>
+    <div class="step"><strong>2. QR32</strong><br>One warp per matrix stages the 32x32 tile and tau in shared memory.</div>
+    <div class="step"><strong>3. Probe</strong><br><code>n=512</code> cases compile and launch a tiny CuTe kernel to prove runtime support.</div>
+    <div class="step"><strong>4. Fallback</strong><br>If any CuTe step fails, correctness falls back to <code>torch.geqrf</code>.</div>
+  </div>
+
+  <h2>Expected Outcomes</h2>
+  <ul>
+    <li>Correctness: passed 22/22 on B200 with both CuTe QR32 and the n=512 probe active.</li>
+    <li>Performance: <code>(20,32)</code> improved to <code>85.4us</code>, beating V13/V15's <code>~134us</code>.</li>
+    <li>Next target: integrate QR32 into the V13 best path, then attack the high-batch <code>n=512</code> trailing update.</li>
+  </ul>
+</main>
+</body>
+</html>

@@ -43,16 +43,27 @@ Always use `--no-tui` when running from agent shells (the TUI requires a real te
 - Orthogonality: `rtol = 100 * n * eps32`
 - Must pass all matrix types: dense, rankdef, nearrank, clustered, band, rowscale, nearcollinear, upper
 
-## Benchmark Shapes (ranked by geometric mean)
+## Benchmark Shapes
 
+> ⚠️ **The leaderboard ranks the geometric mean over 12 shapes, not 7** (confirmed
+> 2026-06-28 from Popcorn ranked output). The 7 dense shapes below are the base set;
+> the ranked set adds 5 stress variants at the two dominant sizes: `(640,512)` ×3
+> (mixed/rankdef seed 770003/clustered seed 770004) and `(60,1024)` ×2 (incl.
+> nearrank seed 770005). Optimize the **12-shape** geomean. The evo benchmark
+> (`evo_benchmark.py`, epoch 2) times all 12; Modal tracks the leaderboard at a
+> stable **×1.05** (Modal slightly higher). See `experiment_plan.md` → "Benchmark
+> Reliability Fix". Historical "Popcorn ranked" 7-shape numbers in the log were
+> actually Modal medians.
+
+7 base dense shapes (the other 5 ranked shapes are variants of (640,512)/(60,1024)):
 
 | batch | n    | Notes                          |
 | ----- | ---- | ------------------------------ |
 | 20    | 32   | Small                          |
 | 40    | 176  | Small                          |
 | 40    | 352  | Medium                         |
-| 640   | 512  | **Critical** — optimizer-style |
-| 60    | 1024 | Large                          |
+| 640   | 512  | **Critical** — optimizer-style (×4 in ranked set) |
+| 60    | 1024 | Large (×3 in ranked set)       |
 | 8     | 2048 | Large                          |
 | 2     | 4096 | Large                          |
 
@@ -145,4 +156,93 @@ For each experiment, add a row to the Results Log table in `experiment_plan.md` 
 - CUDA inline via `torch.utils.cpp_extension.load_inline` for custom kernels
 - FP16/TF32/FP8 allowed internally, output must be FP32
 - Modal for dev/test iteration, Popcorn for leaderboard submission
+
+## Competitive Intelligence (GPU MODE Discord, June 2026)
+
+Clues gathered from the competition Discord. Use these to prioritize work; they
+independently confirm several of our own findings in `experiment_plan.md`.
+
+### Where the frontier actually is
+
+- **The ~500µs leaderboard leader is almost certainly reward-hacking** (caching
+  the probe/test inputs — the harness reuses them). A credible strong competitor
+  noted "500/600us is how fast an implementation that caches probes" runs, and
+  agents have been caught scraping submissions + reward-hacking blog posts.
+  **Do not chase 500µs.** The legit "tight pack" is ~1.5–4k µs (one competitor
+  hit 2300 by hand with just Claude Max + free Modal credits).
+- **Low precision is explicitly allowed** ("they set the error tolerances kind
+  of loose to allow it"). FP8/FP4 can be 3–4× faster, **but only on the trailing
+  GEMM** — CUDA cores can't do FP8/FP4, only tensor cores can, and the GEMM is a
+  minority of the work (see bottleneck breakdown). Naive `allow_tf32=True` blows
+  precision (our V33: 2760× over limit). Winners use **selective/emulated low
+  precision (3×TF32 / split-K) on the GEMM only**, keeping panels in FP32/FP64.
+
+### The real bottleneck is the panel factorization, NOT the GEMM
+
+Profiling shared by a top competitor (weighted into the geomean):
+
+| Stage | Share |
+|---|---|
+| Panel factorization | 38% |
+| Trailing GEMM | 20% |
+| Trailing apply | 16% |
+| Building T matrix | 11% |
+| LU stuff | 8% |
+
+- "The limiting factor is the panel factorizations and the dependencies between
+  them... it ends up being **latency bound**." If someone is 3–4× faster, "it's
+  almost certainly not about the GEMMs." This confirms our V32 finding (the
+  sync-bound serial panel is the wall). **The win comes from a parallel/recursive
+  panel that breaks the inter-panel dependency chain**, not a better GEMM.
+
+### Shape priorities
+
+- **n=512 is the highest bang-for-buck** ("512 is where most of my time went")
+  because the 512 shapes appear most in the geomean. This is our dominant
+  `(640,512)` family.
+- **Bigger shapes (1024/2048/4096) are GEMM-dominant** → where tensor cores /
+  low precision actually pay off. These are still on baseline `geqrf` for us.
+- **n=4096 is the hardest.** Use **Cholesky-QR + tall-skinny / CAQR**
+  (Cholesky QR is explicitly allowed): form AᵀA → Cholesky → Q = A·R⁻¹ with 1–2
+  reorthogonalization passes for stability. Tensor-core friendly, avoids the
+  serial Householder panel.
+
+### Roofline
+
+- Model each shape as memory-bandwidth bound: bytes read+written per kernel ÷
+  B200 bandwidth → lower bound on time. Note "we can't fully saturate a B200 for
+  some of these shapes." Compute this per-shape to know real headroom before
+  investing.
+
+### Reading list (from a competitor following the literature)
+
+- arXiv `2203.03341` — tensor cores on TF32 (relevant to 3×TF32 trailing)
+- arXiv `0806.2159` — communication-avoiding QR (tall-skinny)
+- SIAM `10.1137/18M1218212`
+- Berkeley EECS-2013-175 (tall-skinny CAQR)
+- **MAGMA batched QR from NVIDIA (~2022)** — most directly applicable
+- **Muon / Polar Express** papers — Newton–Schulz polar/orthogonalization
+  iterations (tensor-core-heavy alternative orthogonalization)
+- IBM Journal (Elmroth) — history, O(n³)
+- A tensor-core Householder QR paper (IEEE-locked, done on Ampere; needs scaling
+  to Blackwell)
+
+### Workflow tips from competitors
+
+- **Start fresh context often.** Long sessions plateau when the agent decides it
+  "reached the speed limit"; restarting with fresh context unblocks progress.
+- **Ask the agent to run short tests** to conserve Modal credits (avoids the
+  300s Modal timeout on leaderboard mode).
+- Local GPU (even a 4090) is great for early iteration; move to Modal around
+  ~5000µs. Not strictly required — 2300µs achieved with no local GPU.
+
+### Next actions ranked by leverage
+
+1. **Parallel/recursive panel for `(640,512)`** — break the inter-panel
+   dependency chain (the confirmed #1 bottleneck; V32 single-block couldn't).
+2. **Cholesky-QR (with reorthogonalization) for `(8,2048)` / `(2,4096)`** —
+   both still on baseline `geqrf`; compute-bound → tensor cores should win.
+3. **Selective low-precision trailing GEMM (3×TF32 / FP8 split)** on
+   GEMM-dominant large shapes only; keep panels FP32 to avoid V33-style blowup.
+4. **Compute the bandwidth roofline per shape** to bound the remaining headroom.
 

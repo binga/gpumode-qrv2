@@ -420,75 +420,6 @@ __global__ void build_t_parallel(
     }
 }
 
-// Fused V+T builder: one block per matrix. Builds the unit lower-trapezoidal
-// reflector block V (verbatim build_v_kernel logic, single-block) into the
-// global V buffer, then computes the compact-WY block reflector T (verbatim
-// build_t_parallel logic). Removes one kernel launch per sub-panel vs the
-// two-kernel build_v_ext + build_t_ext path; numerically identical. The
-// __syncthreads after the V write fences the global stores for the T reads.
-__global__ void build_vt_fused(
-    const float* __restrict__ H, const float* __restrict__ tau,
-    float* __restrict__ V, float* __restrict__ T,
-    const int n, const int j_start, const int actual_nb,
-    const int m_panel, const int v_ld, const int t_ld
-) {
-    const int bid = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int nthreads = blockDim.x;
-
-    float* v = V + (size_t)bid * m_panel * v_ld;
-    const float* h = H + (size_t)bid * n * n;
-    const float* tau_b = tau + (size_t)bid * n;
-    float* t = T + (size_t)bid * t_ld * t_ld;
-
-    // --- build V (unit lower-trapezoidal) ---
-    const int per_matrix = m_panel * actual_nb;
-    for (int linear = tid; linear < per_matrix; linear += nthreads) {
-        int row = linear / actual_nb, col = linear % actual_nb;
-        float value = 0.0f;
-        if (row == col) value = 1.0f;
-        else if (row > col) value = h[(size_t)(j_start + row) * n + (j_start + col)];
-        v[row * v_ld + col] = value;
-    }
-    __syncthreads();
-
-    // --- build T (compact-WY) ---
-    extern __shared__ float smem_t[];
-    float* s_dots = smem_t;
-    float* s_work = s_dots + NB;
-
-    for (int idx = tid; idx < t_ld * t_ld; idx += nthreads) t[idx] = 0.0f;
-    __syncthreads();
-
-    for (int k = 0; k < actual_nb; k++) {
-        float tau_k = tau_b[j_start + k];
-        if (tid == 0) t[k * t_ld + k] = tau_k;
-
-        if (k == 0) { __syncthreads(); continue; }
-
-        for (int i = 0; i < k; i++) {
-            float my_dot = 0.0f;
-            for (int r = tid; r < m_panel; r += nthreads) {
-                my_dot += v[r * v_ld + i] * v[r * v_ld + k];
-            }
-            float dot = block_reduce_f(my_dot, s_work, tid, nthreads);
-            if (tid == 0) s_dots[i] = dot;
-            __syncthreads();
-        }
-
-        if (tid == 0) {
-            for (int i = 0; i < k; i++) {
-                double acc = 0.0;
-                for (int p = 0; p < k; p++) {
-                    acc += (double)t[i * t_ld + p] * (double)s_dots[p];
-                }
-                t[i * t_ld + k] = (float)(-(double)tau_k * acc);
-            }
-        }
-        __syncthreads();
-    }
-}
-
 __global__ void fused_qr_small(
     const float* __restrict__ A_in, float* __restrict__ H_out,
     float* __restrict__ tau_out, const int n
@@ -624,18 +555,11 @@ std::vector<torch::Tensor> dispatch_qr(torch::Tensor A) {
             auto T_view = T.slice(1, 0, actual_nb).slice(2, 0, actual_nb).contiguous();
 
             if (n <= 512) {
-                // Memory-traffic fusion for the medium trailing update (mirrors
-                // exp_0038/exp_0051 from the n=512 Triton path). Drop the explicit
-                // contiguous() copy of the strided trailing block: feed the strided
-                // view straight to cuBLAS via at::matmul for W1, and fuse the rank-nb
-                // apply + subtract into one in-place baddbmm_ (trailing = 1*trailing
-                // - V@W2) instead of bmm(V,W2) materialization + sub_. All FP32/IEEE
-                // -- numerically identical, removes one full-block alloc+copy and one
-                // full-block intermediate per sub-panel.
-                auto trailing = H.slice(1, j, n).slice(2, j_end, n);
-                auto W1 = at::matmul(V_view.transpose(1,2), trailing);
+                // Proven V22/V24 trailing path for medium/512.
+                auto trailing_c = H.slice(1, j, n).slice(2, j_end, n).contiguous();
+                auto W1 = at::bmm(V_view.transpose(1,2), trailing_c);
                 auto W2 = at::bmm(T_view.transpose(1,2), W1);
-                trailing.baddbmm_(V_view, W2, 1.0, -1.0);
+                H.slice(1, j, n).slice(2, j_end, n).sub_(at::bmm(V_view, W2));
             } else {
                 // n=1024: avoid the large contiguous() copy via strided matmul.
                 auto trailing = H.slice(1, j, n).slice(2, j_end, n);
@@ -675,21 +599,6 @@ torch::Tensor build_t_ext(torch::Tensor V, torch::Tensor tau, int n, int j, int 
         m_panel, nb, nb, nb, j, n);
     return T;
 }
-
-// Fused single-launch V+T builder (n=512 path). Returns {V, T}.
-std::vector<torch::Tensor> build_vt_ext(torch::Tensor H, torch::Tensor tau, int n, int j, int nb, int batch) {
-    int m_panel = n - j;
-    auto V = torch::empty({batch, m_panel, nb}, H.options());
-    auto T = torch::empty({batch, nb, nb}, H.options());
-    int threads = 256;
-    int num_warps = threads / 32;
-    size_t t_smem = (NB + num_warps) * sizeof(float);
-    build_vt_fused<<<batch, threads, t_smem>>>(
-        H.data_ptr<float>(), tau.data_ptr<float>(),
-        V.data_ptr<float>(), T.data_ptr<float>(),
-        n, j, nb, m_panel, nb, nb);
-    return {V, T};
-}
 """
 
 cpp_src = r"""
@@ -698,18 +607,252 @@ cpp_src = r"""
 std::vector<torch::Tensor> dispatch_qr(torch::Tensor A);
 torch::Tensor build_v_ext(torch::Tensor H, int n, int j, int nb, int batch);
 torch::Tensor build_t_ext(torch::Tensor V, torch::Tensor tau, int n, int j, int nb, int batch);
-std::vector<torch::Tensor> build_vt_ext(torch::Tensor H, torch::Tensor tau, int n, int j, int nb, int batch);
 """
 
 module = load_inline(
     name="qr_v31_blocked_large",
     cpp_sources=[cpp_src],
     cuda_sources=[cuda_src],
-    functions=["dispatch_qr", "build_v_ext", "build_t_ext", "build_vt_ext"],
+    functions=["dispatch_qr", "build_v_ext", "build_t_ext"],
     extra_cuda_cflags=["-O3", "-std=c++17"],
     extra_cflags=["-O3", "-std=c++17"],
     verbose=True,
 )
+
+
+# ============================================================================
+# SINGLE-STREAM BATCHED cuSOLVER/cuBLAS backend for the n=2048 CholeskyQR2 +
+# Householder-reconstruction path.
+#
+# CRITICAL submittability fact (diagnosed in the experiment log): torch.linalg's
+# BATCHED cholesky / solve_triangular fan the batch out across a POOL of side
+# streams, which Popcorn's anti-cheat rejects ("work on another stream"). The
+# batched cuSOLVER/cuBLAS *_Batched APIs below instead process the WHOLE batch in
+# ONE kernel launch on a SINGLE stream (no stream pool), so they recover the
+# batched speed while staying submittable. All handles come from torch
+# (at::cuda::getCurrentCUDA{Blas,SolverDn}Handle()), which are bound to the
+# harness's current stream -> every launch lands on getCurrentCUDAStream().
+#
+# Backend APIs used (all current-stream; NON-batched blocked routines looped over
+# the small 2-8 batch, because the *_Batched variants run an UNBLOCKED algorithm
+# that is ~10x slower for a few LARGE matrices -- measured (8,2048) 487ms batched
+# vs ~60ms here):
+#   * cusolverDnSpotrf  -- blocked Cholesky (FILL_LOWER, see below)
+#   * cublasStrsm       -- triangular solve  Q <- Q * R^{-1}
+#   * cusolverDnSgetrf  -- LU with devIpiv=NULL => NO pivoting
+#                          (exactly the no-pivot LU the reconstruction needs)
+#
+# Column-major care: cuSOLVER/cuBLAS read column-major. A row-major (n,n) buffer
+# is interpreted as its transpose. For the *symmetric* Gram matrix G this means
+# the column-major view equals G itself; we then use FILL_MODE_LOWER so the
+# factor lands in what is the UPPER triangle of the row-major buffer, yielding an
+# upper-triangular R with G = R^T R (== torch.linalg.cholesky(G, upper=True)).
+# The triangular solve then uses SIDE_LEFT/FILL_LOWER/OP_N on the same buffer to
+# realise the right-side solve  X R = Q  (X = Q R^{-1}) in math space. The
+# no-pivot LU keeps the existing Mt = M^T transpose (so the column-major view is
+# M), identical math to the previous cusolverDnSgetrf loop, just batched.
+# ============================================================================
+batched_cuda_src = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cusolverDn.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+
+// One CholeskyQR pass, single-stream, in place:
+//   potrf(G)  -> packed R (upper triangle of row-major G, G = R^T R)
+//   trsm      -> Q <- Q * R^{-1}
+// `info` (int32, size b) receives potrf per-matrix status (0 = SPD ok).
+//
+// IMPORTANT: we use the NON-batched (blocked) cuSOLVER/cuBLAS routines in a loop
+// over the (small, 2-8) batch, NOT the *_Batched variants. The *_Batched APIs
+// run an UNBLOCKED algorithm tuned for many *small* matrices; for a few *large*
+// (n=2048) matrices they are ~10x slower (measured (8,2048) potrfBatched/
+// trsmBatched -> 487ms vs ~60ms here). The non-batched routines use the fast
+// blocked algorithm. Every call lands on the torch handle's stream
+// (getCurrentCUDAStream) -> single-stream, NO side-stream pool (the reason
+// torch.linalg's batched path is non-submittable). The batch loop serializes on
+// one stream, which is correct and submittable.
+void cholqr_pass(torch::Tensor G, torch::Tensor Q, torch::Tensor info) {
+    TORCH_CHECK(G.is_cuda() && G.dtype() == torch::kFloat32 && G.is_contiguous());
+    TORCH_CHECK(Q.is_cuda() && Q.dtype() == torch::kFloat32 && Q.is_contiguous());
+    TORCH_CHECK(G.dim() == 3 && G.size(1) == G.size(2));
+    TORCH_CHECK(Q.dim() == 3 && Q.size(1) == G.size(1) && Q.size(2) == G.size(1));
+    const int b = G.size(0), n = G.size(1);
+
+    cusolverDnHandle_t solver = at::cuda::getCurrentCUDASolverDnHandle();
+    cublasHandle_t blas = at::cuda::getCurrentCUDABlasHandle();
+
+    int lwork = 0;
+    cusolverDnSpotrf_bufferSize(solver, CUBLAS_FILL_MODE_LOWER, n,
+                                G.data_ptr<float>(), n, &lwork);
+    auto work = torch::empty({lwork > 0 ? lwork : 1}, G.options());
+    const float alpha = 1.0f;
+
+    for (int i = 0; i < b; ++i) {
+        float* Gi = G.data_ptr<float>() + (size_t)i * n * n;
+        float* Qi = Q.data_ptr<float>() + (size_t)i * n * n;
+        // Blocked Cholesky. FILL_LOWER on the column-major view (== upper triangle
+        // of the row-major buffer) -> R upper-tri (row-major), G = R^T R.
+        cusolverDnSpotrf(solver, CUBLAS_FILL_MODE_LOWER, n, Gi, n,
+                         work.data_ptr<float>(), lwork, info.data_ptr<int>() + i);
+        // Triangular solve. Math: Q <- Q R^{-1} (right solve, upper-tri R). In the
+        // column-major view this is a LEFT solve R_cm X = Q_cm with R_cm lower-tri
+        // (FILL_LOWER), op = N. cublasStrsm overwrites Qi in place.
+        cublasStrsm(blas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+                    CUBLAS_DIAG_NON_UNIT, n, n, &alpha, Gi, n, Qi, n);
+    }
+}
+
+// No-pivot LU (cusolverDnSgetrf with devIpiv=NULL) on Mt (row-major M^T =>
+// column-major M). Non-batched blocked routine, looped over the small batch on
+// the current stream (the *_Batched variant is again far slower at large n).
+// Identical math to the proven exp_0016 path; PivotArray=NULL => no pivoting.
+void getrf_nopiv_batched(torch::Tensor Mt, torch::Tensor info) {
+    TORCH_CHECK(Mt.is_cuda() && Mt.dtype() == torch::kFloat32 && Mt.is_contiguous());
+    TORCH_CHECK(Mt.dim() == 3 && Mt.size(1) == Mt.size(2));
+    const int b = Mt.size(0), n = Mt.size(1);
+
+    cusolverDnHandle_t solver = at::cuda::getCurrentCUDASolverDnHandle();
+    int lwork = 0;
+    cusolverDnSgetrf_bufferSize(solver, n, n, Mt.data_ptr<float>(), n, &lwork);
+    auto work = torch::empty({lwork > 0 ? lwork : 1}, Mt.options());
+    for (int i = 0; i < b; ++i) {
+        float* Ai = Mt.data_ptr<float>() + (size_t)i * n * n;
+        cusolverDnSgetrf(solver, n, n, Ai, n, work.data_ptr<float>(), nullptr,
+                         info.data_ptr<int>() + i);
+    }
+}
+"""
+
+batched_cpp_src = r"""
+#include <torch/extension.h>
+void cholqr_pass(torch::Tensor G, torch::Tensor Q, torch::Tensor info);
+void getrf_nopiv_batched(torch::Tensor Mt, torch::Tensor info);
+"""
+
+# at::cuda::getCurrentCUDASolverDnHandle lives in libtorch_cuda_linalg.so, which
+# torch loads lazily on first torch.linalg call. Force-load it with RTLD_GLOBAL
+# (using torch's own lib path) so the symbol is resolvable when the extension
+# below is dlopen'd here at import time. Without this the module fails to import
+# with `undefined symbol: _ZN2at4cuda28getCurrentCUDASolverDnHandleEv`.
+import ctypes as _ctypes
+import os as _os
+try:
+    _ctypes.CDLL(
+        _os.path.join(_os.path.dirname(torch.__file__), "lib", "libtorch_cuda_linalg.so"),
+        mode=_ctypes.RTLD_GLOBAL,
+    )
+except OSError:
+    pass
+
+batched_mod = load_inline(
+    name="qr_batched_linalg",
+    cpp_sources=[batched_cpp_src],
+    cuda_sources=[batched_cuda_src],
+    functions=["cholqr_pass", "getrf_nopiv_batched"],
+    extra_cuda_cflags=["-O3", "-std=c++17"],
+    extra_cflags=["-O3", "-std=c++17"],
+    extra_ldflags=["-lcusolver", "-lcublas"],
+    verbose=True,
+)
+
+
+# ============================================================================
+# n>=2048 path: tensor-core orthogonalization (shifted CholeskyQR3) + standard
+# Householder reflector RECONSTRUCTION via no-pivot LU.
+#
+# Replaces the sequential cuSOLVER geqrf panel (the confirmed #1 bottleneck on
+# (8,2048)=71.7ms / (2,4096)=49.1ms). All steps are BLAS-3 / cuSOLVER-native:
+#   1. Orthogonalize: shifted CholeskyQR3.  G=A^T A (GEMM), R=chol(G) (potrf),
+#      Q=A R^-1 (trsm), x3 passes (first shifted so FP32 potrf stays PD for the
+#      ill-conditioned A^T A at these n). Yields orthonormal Q + upper R, A=QR.
+#   2. Reconstruct (Ballard/Demmel "Householder from TSQR"): the product of the
+#      standard reflectors equals Q*S (S=-sign(diag Q)); so  I - Q*S = V*(T*V^T)
+#      = L*U is a NO-PIVOT LU.  V=tril(L,-1) are the reflector vectors; we set
+#      tau=2/||v||^2 (genuine reflectors => householder_product is EXACTLY
+#      orthogonal, so the orthogonality gate is free) and R into triu(H).
+#
+# Numerically validated (offline, fp32): (8,2048) dense factor~4.0 orth~0.3;
+# (2,4096) dense factor~0.01 orth~0.3 (limits 20 / 100). Ill-conditioned inputs
+# (A^T A not numerically PD, e.g. band cond=4) make potrf raise -> we fall back
+# to the proven exp_0011 blocked-Householder path (correct, only the untimed
+# stress shapes hit it, so no score cost).
+# ============================================================================
+_EPS32 = 1.1920929e-07
+_CHOLQR_PASSES = 3
+_CHOLQR_SHIFT = 11.0
+
+
+def _set_fp32_prec(mode: str) -> None:
+    try:
+        torch.backends.cuda.matmul.fp32_precision = mode
+    except Exception:
+        pass
+
+
+def _shifted_cholqr(A: torch.Tensor, passes: int, shiftc: float, prec: str):
+    n = A.shape[-1]
+    # Q is overwritten IN PLACE by the batched trsm each pass, so start from a
+    # contiguous owned copy (A itself must not be mutated).
+    Q = A.contiguous().clone()
+    Racc = None
+    eye = torch.eye(n, device=A.device, dtype=A.dtype)
+    for p in range(passes):
+        # G = Q^T Q is the dominant GEMM; TF32 tensor cores buy ~4x at the large
+        # shapes that have ample factor headroom. potrf/trsm stay FP32 (cuSOLVER).
+        _set_fp32_prec(prec)
+        G = torch.matmul(Q.transpose(-1, -2), Q)
+        _set_fp32_prec("ieee")
+        if p == 0:
+            d = torch.diagonal(G, dim1=-2, dim2=-1).amax(-1)
+            G = G + (shiftc * n * _EPS32 * d)[..., None, None] * eye
+        G = G.contiguous()
+        # SINGLE-STREAM BATCHED Cholesky + triangular solve (one launch each, no
+        # stream pool, current stream only). cholqr_pass factors G in place
+        # (packed R in the upper triangle, G = R^T R) and overwrites Q <- Q R^{-1}.
+        info = torch.zeros(G.shape[0], dtype=torch.int32, device=A.device)
+        batched_mod.cholqr_pass(G, Q, info)
+        # potrf raises (info != 0) for non-PD G (ill-conditioned A^T A). Detect it
+        # explicitly so the caller's try/except falls back to the blocked path
+        # (matches torch.linalg.cholesky's raise-on-failure semantics).
+        if bool(info.ne(0).any()):
+            raise RuntimeError("potrf not positive-definite")
+        R = torch.triu(G)
+        if Racc is None:
+            Racc = R
+        else:
+            _set_fp32_prec(prec)
+            Racc = torch.matmul(R, Racc)
+            _set_fp32_prec("ieee")
+    return Q, Racc
+
+
+def _qr_cholqr_recon(data: torch.Tensor, passes: int = _CHOLQR_PASSES,
+                     prec: str = "ieee") -> output_t:
+    batch, n, _ = data.shape
+    try:
+        Q, R = _shifted_cholqr(data, passes, _CHOLQR_SHIFT, prec)
+        if not torch.isfinite(Q).all():
+            raise RuntimeError("cholqr nonfinite")
+        s = -torch.sign(torch.diagonal(Q, dim1=-2, dim2=-1))
+        s = torch.where(s == 0, torch.ones_like(s), s)
+        eye = torch.eye(n, device=data.device, dtype=data.dtype).expand(batch, n, n)
+        M = eye - Q * s.unsqueeze(1)                       # I - Q*S (column scaled)
+        Mt = M.transpose(-1, -2).contiguous()             # col-major view => factors M
+        # SINGLE-STREAM BATCHED no-pivot LU (one launch, current stream only).
+        lu_info = torch.zeros(batch, dtype=torch.int32, device=data.device)
+        batched_mod.getrf_nopiv_batched(Mt, lu_info)
+        C = Mt.transpose(-1, -2)                           # packed L\U of M
+        V = torch.tril(C, diagonal=-1)                     # reflector vectors (unit diag implicit)
+        tau = 2.0 / (1.0 + (V * V).sum(dim=1))            # genuine reflectors -> orth free
+        H = V + torch.triu(R * s.unsqueeze(2))            # below: v; on/above: R_stored = S R
+        if not (torch.isfinite(H).all() and torch.isfinite(tau).all()):
+            raise RuntimeError("recon nonfinite")
+        return H, tau
+    except Exception:
+        # Ill-conditioned / non-PD: fall back to the proven exp_0011 blocked path.
+        return _qr_blocked_lowprec(data, _LARGE_NB, _LARGE_PREC)
 
 
 def _next_pow2(x: int) -> int:
@@ -719,8 +862,7 @@ def _next_pow2(x: int) -> int:
     return p
 
 
-def _qr_blocked_triton(data: torch.Tensor, panel_warps: int, nb: int = 32,
-                       fuse_vt: bool = False) -> output_t:
+def _qr_blocked_triton(data: torch.Tensor, panel_warps: int, nb: int = 32) -> output_t:
     """Blocked-WY QR with a Triton FP32 panel + cuBLAS/at::matmul trailing.
 
     Only the panel factorization is replaced (vs the C++ panel); the V/T builders
@@ -767,31 +909,24 @@ def _qr_blocked_triton(data: torch.Tensor, panel_warps: int, nb: int = 32,
             if trailing_cols <= 0:
                 break
 
-            if fuse_vt:
-                # Single fused launch builds both V and T (n=512 path).
-                V, T = module.build_vt_ext(H, tau, n, j, nb, batch)
-            else:
-                V = module.build_v_ext(H, n, j, nb, batch)        # (batch, m, nb)
-                T = module.build_t_ext(V, tau, n, j, nb, batch)   # (batch, nb, nb)
+            V = module.build_v_ext(H, n, j, nb, batch)        # (batch, m, nb)
+            T = module.build_t_ext(V, tau, n, j, nb, batch)   # (batch, nb, nb)
 
             trailing_view = H[:, j:n, j_end:n]
             if n <= 512:
-                # Medium/512: keep W1/W2 in IEEE for rowscale/band correctness,
-                # but avoid the explicit trailing copy and let cuBLAS handle the
-                # strided trailing view directly.
+                # Medium/512: contiguous copy + bmm (proven V22/V24 path).
+                trailing_c = trailing_view.contiguous()
                 _set_prec("ieee")
-                W1 = torch.matmul(V.transpose(1, 2), trailing_view)
+                W1 = torch.bmm(V.transpose(1, 2), trailing_c)
                 W2 = torch.bmm(T.transpose(1, 2), W1)
                 _set_prec("tf32")
-                # Fuse the rank-nb apply + subtract into one in-place baddbmm
-                # (trailing = 1*trailing + (-1)*(V@W2)) instead of bmm + sub_.
-                trailing_view.baddbmm_(V, W2, beta=1.0, alpha=-1.0)
+                trailing_view -= torch.bmm(V, W2)
             else:
-                # n=1024 dense has more factor headroom in the held-out gate, so
-                # run the whole trailing update on TF32 tensor cores.
-                _set_prec("tf32")
+                # n=1024: strided matmul avoids the large contiguous() copy.
+                _set_prec("ieee")
                 W1 = torch.matmul(V.transpose(1, 2), trailing_view)
                 W2 = torch.matmul(T.transpose(1, 2), W1)
+                _set_prec("tf32")
                 trailing_view -= torch.matmul(V, W2)
     finally:
         _set_prec(_prev_prec if _prev_prec is not None else "ieee")
@@ -898,360 +1033,6 @@ def _qr_blocked_lowprec(data: torch.Tensor, nb: int, prec: str) -> output_t:
     return H, tau
 
 
-# ============================================================================
-# n==2048 path: SUBMITTABLE CholeskyQR2 + Householder-reconstruction.
-#
-# Recovers the -39% (8,2048) win (71.8k -> ~44k us) while staying entirely on
-# the implicit default queue so Popcorn accepts it. Every step uses ONLY
-# (a) hand-written default-queue CUDA kernels and (b) GEMM via torch.matmul/bmm.
-# No vendor triangular-solve API, no batched-factorization queue pools, no side
-# queues.
-#   1. G = Q^T Q                          (GEMM via torch.matmul)
-#   2. R = chol(G) (upper, G=R^T R)        BLOCKED: hand-written default-queue
-#      diagonal-block Cholesky+inverse CUDA kernel + GEMM panel/trailing.
-#      The kernel also emits the per-diagonal-block inverse R_kk^{-1}.
-#   3. Q <- Q R^{-1}                       PURE GEMM: blocked right-solve X R = Q
-#      via a forward sweep of GEMMs using the per-block inverses from step 2 (no
-#      vendor solver API). (x passes; first pass diagonally shifted so FP32
-#      chol(A^T A) stays PD.)
-#   4. Reconstruct standard (H, tau): M = I - Q*S (S=-sign(diag Q)); no-pivot LU
-#      M = L U via a hand-written default-queue diagonal-block LU+inverse kernel
-#      + GEMM trailing; V=tril(L,-1), tau=2/||v||^2 (genuine reflectors =>
-#      orthogonality gate free), R into triu.
-#
-# Numerical guard: FP32 chol of A^T A is non-PD for kappa(A) > ~2900. A diagonal
-# SHIFT keeps the first pass PD for the dense (8,2048) target; truly ill-
-# conditioned types (band cond~1e7) still go non-PD -> the diagonal kernel flags
-# it (info != 0) -> we fall back to the proven geqrf blocked path so the
-# correctness gate passes for those matrix types at no score cost (untimed).
-# ============================================================================
-cqr_cuda_src = r"""
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
-#include <vector>
-
-__device__ __forceinline__ float blk_reduce_sum(float val, float* scratch, int tid, int nt) {
-    for (int o = 16; o > 0; o >>= 1) val += __shfl_down_sync(0xffffffffu, val, o);
-    int lane = tid & 31, wid = tid >> 5;
-    if (lane == 0) scratch[wid] = val;
-    __syncthreads();
-    int nwarps = (nt + 31) >> 5;
-    val = (tid < nwarps) ? scratch[tid] : 0.0f;
-    if (wid == 0) { for (int o = 16; o > 0; o >>= 1) val += __shfl_down_sync(0xffffffffu, val, o); }
-    if (tid == 0) scratch[0] = val;
-    __syncthreads();
-    return scratch[0];
-}
-
-// Cholesky of an SPD w x w block (row-major): R upper-tri with G = R^T R, plus
-// Rinv = R^{-1} (upper-tri). One CUDA block per batch element. Serial over the w
-// columns; threads parallelise the per-column reduction / row update / inverse.
-__global__ void chol_diag_inv_kernel(
-    const float* __restrict__ G, float* __restrict__ Rout, float* __restrict__ Rinvout,
-    int* __restrict__ info, int w)
-{
-    const int bid = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
-    extern __shared__ float sm[];
-    float* sR = sm;               // w*w : G -> R (upper)
-    float* sRi = sm + w * w;      // w*w : R^{-1} (upper)
-    __shared__ float red[32];
-    __shared__ float s_rjj;
-    __shared__ int s_bad;
-    const float* Gi = G + (size_t)bid * w * w;
-    for (int idx = tid; idx < w * w; idx += nt) sR[idx] = Gi[idx];
-    if (tid == 0) s_bad = 0;
-    __syncthreads();
-
-    for (int j = 0; j < w; ++j) {
-        float part = 0.0f;
-        for (int p = tid; p < j; p += nt) { float v = sR[p * w + j]; part += v * v; }
-        float tot = blk_reduce_sum(part, red, tid, nt);
-        if (tid == 0) {
-            float dd = sR[j * w + j] - tot;
-            if (!(dd > 0.0f)) { s_bad = 1; dd = 1e-30f; }
-            float rjj = sqrtf(dd);
-            sR[j * w + j] = rjj;
-            s_rjj = rjj;
-        }
-        __syncthreads();
-        float inv_rjj = 1.0f / s_rjj;
-        for (int i = j + 1 + tid; i < w; i += nt) {
-            float s = sR[j * w + i];
-            for (int p = 0; p < j; ++p) s -= sR[p * w + j] * sR[p * w + i];
-            sR[j * w + i] = s * inv_rjj;
-        }
-        __syncthreads();
-    }
-    for (int idx = tid; idx < w * w; idx += nt) {
-        int r = idx / w, c = idx - r * w;
-        if (r > c) sR[idx] = 0.0f;
-    }
-    __syncthreads();
-    // invert upper-tri R column by column (each column independent)
-    for (int j = tid; j < w; j += nt) {
-        for (int i = 0; i < w; ++i) sRi[i * w + j] = 0.0f;
-        sRi[j * w + j] = 1.0f / sR[j * w + j];
-        for (int i = j - 1; i >= 0; --i) {
-            float s = 0.0f;
-            for (int k = i + 1; k <= j; ++k) s += sR[i * w + k] * sRi[k * w + j];
-            sRi[i * w + j] = -s / sR[i * w + i];
-        }
-    }
-    __syncthreads();
-    float* Ro = Rout + (size_t)bid * w * w;
-    float* Rio = Rinvout + (size_t)bid * w * w;
-    for (int idx = tid; idx < w * w; idx += nt) { Ro[idx] = sR[idx]; Rio[idx] = sRi[idx]; }
-    if (tid == 0 && s_bad) info[bid] = 1;
-}
-
-// No-pivot LU of a w x w block (row-major): M = L U (L unit-lower, U upper).
-// Outputs strict-lower L, L^{-1} (unit lower), U^{-1} (upper).
-__global__ void lu_diag_inv_kernel(
-    const float* __restrict__ M, float* __restrict__ Lout,
-    float* __restrict__ Linvout, float* __restrict__ Uinvout,
-    int* __restrict__ info, int w)
-{
-    const int bid = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
-    extern __shared__ float sm[];
-    float* sA = sm;               // w*w : packed L\U
-    float* sI = sm + w * w;       // w*w : inverse scratch
-    __shared__ int s_bad;
-    const float* Mi = M + (size_t)bid * w * w;
-    for (int idx = tid; idx < w * w; idx += nt) sA[idx] = Mi[idx];
-    if (tid == 0) s_bad = 0;
-    __syncthreads();
-
-    // right-looking no-pivot LU
-    for (int k = 0; k < w; ++k) {
-        float piv = sA[k * w + k];
-        if (tid == 0 && !(fabsf(piv) > 1e-20f)) s_bad = 1;
-        __syncthreads();
-        piv = sA[k * w + k];
-        float invp = 1.0f / piv;
-        for (int i = k + 1 + tid; i < w; i += nt) sA[i * w + k] *= invp;
-        __syncthreads();
-        int tw = w - k - 1;
-        for (int idx = tid; idx < tw * tw; idx += nt) {
-            int ii = idx / tw, jj = idx - ii * tw;
-            int i = k + 1 + ii, j = k + 1 + jj;
-            sA[i * w + j] -= sA[i * w + k] * sA[k * w + j];
-        }
-        __syncthreads();
-    }
-    // L^{-1} (unit lower): forward substitution, one thread per column
-    for (int j = tid; j < w; j += nt) {
-        for (int i = 0; i < w; ++i) sI[i * w + j] = 0.0f;
-        sI[j * w + j] = 1.0f;
-        for (int i = j + 1; i < w; ++i) {
-            float s = 0.0f;
-            for (int k = j; k < i; ++k) s += sA[i * w + k] * sI[k * w + j];
-            sI[i * w + j] = -s;
-        }
-    }
-    __syncthreads();
-    {
-        float* o = Linvout + (size_t)bid * w * w;
-        for (int idx = tid; idx < w * w; idx += nt) o[idx] = sI[idx];
-    }
-    __syncthreads();
-    // U^{-1} (upper): backward substitution
-    for (int j = tid; j < w; j += nt) {
-        for (int i = 0; i < w; ++i) sI[i * w + j] = 0.0f;
-        sI[j * w + j] = 1.0f / sA[j * w + j];
-        for (int i = j - 1; i >= 0; --i) {
-            float s = 0.0f;
-            for (int k = i + 1; k <= j; ++k) s += sA[i * w + k] * sI[k * w + j];
-            sI[i * w + j] = -s / sA[i * w + i];
-        }
-    }
-    __syncthreads();
-    {
-        float* o = Uinvout + (size_t)bid * w * w;
-        for (int idx = tid; idx < w * w; idx += nt) o[idx] = sI[idx];
-    }
-    float* Lo = Lout + (size_t)bid * w * w;
-    for (int idx = tid; idx < w * w; idx += nt) {
-        int r = idx / w, c = idx - r * w;
-        Lo[idx] = (r > c) ? sA[idx] : 0.0f;
-    }
-    if (tid == 0 && s_bad) info[bid] = 1;
-}
-
-static const int CQR_THREADS = 256;
-
-std::vector<torch::Tensor> chol_diag_inv(torch::Tensor G) {
-    TORCH_CHECK(G.is_cuda() && G.dtype() == torch::kFloat32 && G.is_contiguous());
-    TORCH_CHECK(G.dim() == 3 && G.size(1) == G.size(2));
-    const int b = G.size(0), w = G.size(2);
-    auto R = torch::zeros_like(G);
-    auto Rinv = torch::zeros_like(G);
-    auto info = torch::zeros({b}, torch::dtype(torch::kInt32).device(G.device()));
-    size_t smem = (size_t)2 * w * w * sizeof(float);
-    cudaFuncSetAttribute(chol_diag_inv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    chol_diag_inv_kernel<<<b, CQR_THREADS, smem>>>(
-        G.data_ptr<float>(), R.data_ptr<float>(), Rinv.data_ptr<float>(),
-        info.data_ptr<int>(), w);
-    return {R, Rinv, info};
-}
-
-std::vector<torch::Tensor> lu_diag_inv(torch::Tensor M) {
-    TORCH_CHECK(M.is_cuda() && M.dtype() == torch::kFloat32 && M.is_contiguous());
-    TORCH_CHECK(M.dim() == 3 && M.size(1) == M.size(2));
-    const int b = M.size(0), w = M.size(2);
-    auto L = torch::zeros_like(M);
-    auto Linv = torch::zeros_like(M);
-    auto Uinv = torch::zeros_like(M);
-    auto info = torch::zeros({b}, torch::dtype(torch::kInt32).device(M.device()));
-    size_t smem = (size_t)2 * w * w * sizeof(float);
-    cudaFuncSetAttribute(lu_diag_inv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    lu_diag_inv_kernel<<<b, CQR_THREADS, smem>>>(
-        M.data_ptr<float>(), L.data_ptr<float>(), Linv.data_ptr<float>(),
-        Uinv.data_ptr<float>(), info.data_ptr<int>(), w);
-    return {L, Linv, Uinv, info};
-}
-"""
-cqr_cpp_src = r"""
-#include <torch/extension.h>
-#include <vector>
-std::vector<torch::Tensor> chol_diag_inv(torch::Tensor G);
-std::vector<torch::Tensor> lu_diag_inv(torch::Tensor M);
-"""
-cqr_mod = load_inline(
-    name="qr_cholqr_custom",
-    cpp_sources=[cqr_cpp_src],
-    cuda_sources=[cqr_cuda_src],
-    functions=["chol_diag_inv", "lu_diag_inv"],
-    extra_cuda_cflags=["-O3", "-std=c++17"],
-    extra_cflags=["-O3", "-std=c++17"],
-    verbose=True,
-)
-
-_EPS32 = 1.1920929e-07
-_CHOLQR_PASSES = 2
-_CHOLQR_SHIFT = 11.0
-_CHOL_NB = 128
-_LU_NB = 128
-
-
-def _cqr_set_prec(mode: str) -> None:
-    try:
-        torch.backends.cuda.matmul.fp32_precision = mode
-    except Exception:
-        pass
-
-
-def _blocked_chol_upper(G: torch.Tensor, nb: int):
-    """Right-looking blocked Cholesky: G = R^T R, R upper. G is mutated (trailing
-    Schur complement). Diagonal blocks factored + inverted by the custom kernel;
-    panel/trailing updates are cuBLAS GEMMs (default queue). Also returns the
-    per-diagonal-block inverses R_kk^{-1} (used for the GEMM right-solve). Raises
-    on non-PD."""
-    b, n, _ = G.shape
-    R = torch.zeros_like(G)
-    diag_invs = []
-    for k in range(0, n, nb):
-        ke = min(k + nb, n)
-        Gkk = G[:, k:ke, k:ke].contiguous()
-        Rkk, Rinv, info = cqr_mod.chol_diag_inv(Gkk)
-        if bool(info.ne(0).any()):
-            raise RuntimeError("chol non-PD")
-        R[:, k:ke, k:ke] = Rkk
-        diag_invs.append(Rinv)
-        if ke < n:
-            Gkr = G[:, k:ke, ke:].contiguous()            # (b, w, rest)
-            Rkr = torch.matmul(Rinv.transpose(1, 2), Gkr)  # R_kk^{-T} @ G_kr
-            R[:, k:ke, ke:] = Rkr
-            G[:, ke:, ke:] = G[:, ke:, ke:] - torch.matmul(Rkr.transpose(1, 2), Rkr)
-    return R, diag_invs
-
-
-def _rinv_rsolve_blocked(Q: torch.Tensor, R: torch.Tensor, diag_invs, nb: int) -> torch.Tensor:
-    """X = Q R^{-1} for upper-tri R, via a blocked right-solve of X R = Q. Forward
-    sweep over column blocks: X[:,k] = (Q[:,k] - sum_{j<k} X[:,j] R[j,k]) R[k,k]^{-1},
-    where R[k,k]^{-1} comes from the diagonal-block kernel. Pure GEMM
-    (torch.matmul) on the default queue -- no vendor solver API at all."""
-    b, m, n = Q.shape
-    X = torch.empty_like(Q)
-    for bi, k in enumerate(range(0, n, nb)):
-        ke = min(k + nb, n)
-        rhs = Q[:, :, k:ke]
-        if k > 0:
-            rhs = rhs - torch.matmul(X[:, :, :k], R[:, :k, k:ke])
-        X[:, :, k:ke] = torch.matmul(rhs, diag_invs[bi])
-    return X
-
-
-def _blocked_lu_lower(M: torch.Tensor, nb: int) -> torch.Tensor:
-    """Right-looking blocked no-pivot LU of M (M = L U). Returns V = strict-lower
-    L (the reconstructed reflector vectors). M is mutated. Diagonal blocks
-    factored + inverted by the custom kernel; panels/trailing are cuBLAS GEMMs."""
-    b, n, _ = M.shape
-    V = torch.zeros_like(M)
-    for k in range(0, n, nb):
-        ke = min(k + nb, n)
-        Mkk = M[:, k:ke, k:ke].contiguous()
-        Lkk, Linv, Uinv, info = cqr_mod.lu_diag_inv(Mkk)
-        if bool(info.ne(0).any()):
-            raise RuntimeError("lu singular")
-        V[:, k:ke, k:ke] = Lkk
-        if ke < n:
-            Mkr = M[:, k:ke, ke:].contiguous()   # (b, w, rest)
-            Mrk = M[:, ke:, k:ke].contiguous()   # (b, rest, w)
-            Ukr = torch.matmul(Linv, Mkr)        # U_kr = L_kk^{-1} M_kr
-            Lrk = torch.matmul(Mrk, Uinv)        # L_rk = M_rk U_kk^{-1}
-            V[:, ke:, k:ke] = Lrk
-            M[:, ke:, ke:] = M[:, ke:, ke:] - torch.matmul(Lrk, Ukr)
-    return V
-
-
-def _shifted_cholqr_custom(A: torch.Tensor, passes: int, shiftc: float, prec: str):
-    n = A.shape[-1]
-    Q = A.contiguous().clone()
-    Racc = None
-    eye = torch.eye(n, device=A.device, dtype=A.dtype)
-    for p in range(passes):
-        _cqr_set_prec(prec)
-        G = torch.matmul(Q.transpose(-1, -2), Q)
-        _cqr_set_prec("ieee")
-        if p == 0:
-            d = torch.diagonal(G, dim1=-2, dim2=-1).amax(-1)
-            G = G + (shiftc * n * _EPS32 * d)[..., None, None] * eye
-        G = G.contiguous()
-        R, diag_invs = _blocked_chol_upper(G, _CHOL_NB)
-        Q = _rinv_rsolve_blocked(Q, R, diag_invs, _CHOL_NB)   # Q <- Q R^{-1}, pure GEMM
-        if Racc is None:
-            Racc = R
-        else:
-            _cqr_set_prec(prec)
-            Racc = torch.matmul(R, Racc)
-            _cqr_set_prec("ieee")
-    return Q, Racc
-
-
-def _qr_cholqr_recon(data: torch.Tensor, passes: int = _CHOLQR_PASSES,
-                     prec: str = "ieee") -> output_t:
-    batch, n, _ = data.shape
-    try:
-        Q, R = _shifted_cholqr_custom(data, passes, _CHOLQR_SHIFT, prec)
-        if not torch.isfinite(Q).all():
-            raise RuntimeError("cholqr nonfinite")
-        s = -torch.sign(torch.diagonal(Q, dim1=-2, dim2=-1))
-        s = torch.where(s == 0, torch.ones_like(s), s)
-        eye = torch.eye(n, device=data.device, dtype=data.dtype).expand(batch, n, n)
-        M = (eye - Q * s.unsqueeze(1)).contiguous()        # I - Q*S
-        V = _blocked_lu_lower(M, _LU_NB)                   # reflector vectors
-        tau = 2.0 / (1.0 + (V * V).sum(dim=1))             # genuine reflectors -> orth free
-        H = V + torch.triu(R * s.unsqueeze(2))             # below: v; on/above: S R
-        if not (torch.isfinite(H).all() and torch.isfinite(tau).all()):
-            raise RuntimeError("recon nonfinite")
-        return H, tau
-    except Exception:
-        # Ill-conditioned / non-PD: proven geqrf blocked path (only untimed
-        # stress shapes hit it, so no score cost).
-        return _qr_blocked_lowprec(data, _LARGE_NB, _LARGE_PREC)
-
-
 def custom_kernel(data: input_t) -> output_t:
     cute_qr32 = _try_cute_qr32(data)
     if cute_qr32 is not None:
@@ -1259,15 +1040,19 @@ def custom_kernel(data: input_t) -> output_t:
     if data.dim() == 3 and data.size(1) == data.size(2) and data.size(0) >= 16:
         n = data.size(1)
         if n == 512:
-            return _qr_blocked_triton(data, 4, nb=16, fuse_vt=True)
+            return _qr_blocked_triton(data, 4, nb=16)
         if n == 1024:
             return _qr_blocked_triton(data, 8, nb=16)
     if data.dim() == 3 and data.size(1) == data.size(2) and data.size(1) >= 2048:
-        # n==2048: SUBMITTABLE CholeskyQR2 + Householder reconstruction (with
-        # geqrf fallback). (2,4096) stays on the blocked-lowprec path (CholeskyQR
-        # loses there, +136%).
-        if data.size(1) == 2048:
-            return _qr_cholqr_recon(data)
+        n = data.size(1)
+        # (8,2048): CholeskyQR3 + Householder reconstruction beats the sequential
+        # geqrf panel here (~-11%). FP32 GEMMs (TF32 measured SLOWER on this shape,
+        # and (8,2048)'s factor margin is only ~5x). (2,4096) and any other large n
+        # stay on the proven blocked-Householder path: there the n=4096 cubic
+        # CholeskyQR pipeline (even TF32 / 2-pass) is heavier than geqrf (measured
+        # +38..136% worse), so reconstruction is not a win at that shape.
+        if n == 2048:
+            return _qr_cholqr_recon(data, passes=2, prec="ieee")
         return _qr_blocked_lowprec(data, _LARGE_NB, _LARGE_PREC)
     result = module.dispatch_qr(data)
     return (result[0], result[1])
