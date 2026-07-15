@@ -26,9 +26,11 @@ We worked this in two stages:
 
 ![evo autoresearch progress chart](docs/assets/evo_progress_chart.png)
 
-*Green dots = kept (new best at that point in time), grey = tried and discarded,
-orange star = best result found. Generated straight from the evo run's own
-experiment graph (`.evo/run_0000`), not a mockup.*
+*Blue = hand-written kernels (V0→V31), green = evo autoresearch (V31→V43).
+Dots = individual attempts, step lines = running best, orange star = best
+result found. Both halves are computed from real measurements — the
+hand-written side from `experiment_plan.md`'s per-shape timings, the evo side
+straight from the run's own experiment graph (`.evo/run_0000`) — not a mockup.*
 
 ## Notes on how we made progress
 
